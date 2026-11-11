@@ -312,55 +312,17 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
 }
 
 - (BOOL)swapCachesAtPath:(NSString *)caches toSymlink:(NSString *)target error:(NSError **)error {
+    // 与作者原版一致：先删掉真实目录，再在原位置建符号链接。
+    // 不用 replaceItemAtURL：它对符号链接的处理在 iOS 上没有可靠保证。
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *tmp = [caches stringByAppendingFormat:@".wql_%@", NSUUID.UUID.UUIDString];
-    [fm removeItemAtPath:tmp error:nil];
-
-    if (![fm createSymbolicLinkAtPath:tmp withDestinationPath:target error:error]) {
-        return NO;
-    }
-
-    // 原 Caches 不存在：直接挪过去
-    if (![fm fileExistsAtPath:caches]) {
-        BOOL ok = [fm moveItemAtPath:tmp toPath:caches error:error];
-        if (!ok) [fm removeItemAtPath:tmp error:nil];
-        return ok;
-    }
-
-    // 原子替换：失败时原 Caches 原样保留，不会像“先删再建”那样丢数据
-    BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:caches]
-                   withItemAtURL:[NSURL fileURLWithPath:tmp]
-                  backupItemName:nil
-                         options:0
-                resultingItemURL:NULL
-                           error:error];
-    if (!ok) [fm removeItemAtPath:tmp error:nil];
-    return ok;
+    [fm removeItemAtPath:caches error:nil];
+    return [fm createSymbolicLinkAtPath:caches withDestinationPath:target error:error];
 }
 
 - (BOOL)restoreCaches:(NSString *)caches {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *tmp = [caches stringByAppendingFormat:@".wql_%@", NSUUID.UUID.UUIDString];
-    [fm removeItemAtPath:tmp error:nil];
-
-    if (![fm createDirectoryAtPath:tmp withIntermediateDirectories:NO attributes:nil error:nil]) {
-        return NO;
-    }
-
-    if ([fm fileExistsAtPath:caches]) {
-        BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:caches]
-                       withItemAtURL:[NSURL fileURLWithPath:tmp]
-                      backupItemName:nil
-                             options:0
-                    resultingItemURL:NULL
-                               error:nil];
-        if (!ok) [fm removeItemAtPath:tmp error:nil];
-        return ok;
-    }
-
-    BOOL ok = [fm moveItemAtPath:tmp toPath:caches error:nil];
-    if (!ok) [fm removeItemAtPath:tmp error:nil];
-    return ok;
+    [fm removeItemAtPath:caches error:nil];
+    return [fm createDirectoryAtPath:caches withIntermediateDirectories:NO attributes:nil error:nil];
 }
 
 - (void)releaseHandle:(int64_t)handle {

@@ -23,7 +23,8 @@ WQLApp_FILES = \
 WQLApp_FRAMEWORKS = UIKit Foundation AVFoundation
 WQLApp_RESOURCE_DIRS = Resources
 WQLApp_CFLAGS = -fobjc-arc -O2 -Wall \
-	-Wno-unused-parameter -Wno-deprecated-declarations -Wno-unused-function
+	-Wno-unused-parameter -Wno-deprecated-declarations -Wno-unused-function \
+	-Wno-unused-variable
 WQLApp_CODESIGN_FLAGS = --entitlements $(CURDIR)/entitlements.plist
 WQLApp_INSTALL_PATH = /Applications
 

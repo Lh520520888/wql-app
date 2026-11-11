@@ -1,0 +1,9 @@
+Package: com.wql.app
+Name: WQLApp
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: WQL sandbox collection and upload tool
+Maintainer: wql
+Author: wql
+Section: Utilities
+Depends: firmware (>= 15.0)

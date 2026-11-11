@@ -14,7 +14,7 @@ static wql_fsgetpath_t gFSGetPath = NULL;
 typedef struct {
     char prefix[PATH_MAX];
     size_t len;
-    __unsafe_unretained NSString *key;   // ARC 下结构体里只能放非持有引用
+    __unsafe_unretained NSString *key;
 } wql_prefix_t;
 
 @interface WQLPathLeak ()
@@ -27,6 +27,10 @@ typedef struct {
     if (gFSGetPath) return YES;
     void *h = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW | RTLD_LOCAL);
     gFSGetPath = (wql_fsgetpath_t)dlsym(h ? h : RTLD_DEFAULT, "fsgetpath");
+    if (!gFSGetPath && h) {
+        // 有些版本从 kernel 句柄取不到，退回全局符号表
+        gFSGetPath = (wql_fsgetpath_t)dlsym(RTLD_DEFAULT, "fsgetpath");
+    }
     if (!gFSGetPath) {
         if (error) *error = @"fsgetpath 符号不可用";
         return NO;
@@ -74,13 +78,11 @@ typedef struct {
         if (maxInode == 0) return buckets;
     }
 
-    // 按 fsid 分组：不同卷的目录不能共用一次遍历
     NSMutableDictionary *byVolume = [NSMutableDictionary dictionary];
     for (NSString *dir in directories) {
         NSString *trimmed = [self trimmedPath:dir];
         struct statfs sfs;
         if (statfs(trimmed.fileSystemRepresentation, &sfs) != 0) {
-            // 目录不存在（例如 iOS 27 才有的系统目录）——跳过，不算错误
             continue;
         }
         NSString *vol = [NSString stringWithFormat:@"%d:%d", sfs.f_fsid.val[0], sfs.f_fsid.val[1]];
@@ -123,7 +125,6 @@ typedef struct {
                 size_t plen = prefixes[i].len;
                 if (strncmp(buf, prefixes[i].prefix, plen) != 0) continue;
                 if (buf[plen] != '/') continue;
-                // 只要直接子项：剩余部分不能再出现 '/'
                 if (strchr(buf + plen + 1, '/')) continue;
 
                 NSString *s = [[NSFileManager defaultManager]
@@ -143,7 +144,6 @@ typedef struct {
     if (progress) progress(totalDone, totalDone);
     if (completed) *completed = !wasCancelled;
 
-    // 去重后返回不可变数组
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (NSString *k in buckets) out[k] = [buckets[k] copy];
     return out;

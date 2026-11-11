@@ -1,0 +1,41 @@
+# Codemagic CI 配置（备用构建通道）
+# 用法：把本文件放在仓库根目录，Codemagic 会自动识别。
+workflows:
+  wqlapp:
+    name: WQLApp (Theos)
+    # 免费额度一般用 mac_mini_m2；若提示不可用，改成 mac_mini_m1
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+
+    scripts:
+      - name: 环境信息
+        script: |
+          set -e
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 安装 Theos
+        script: |
+          set -e
+          export THEOS=$HOME/theos
+          brew install ldid xz 2>/dev/null || true
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "SDK=$SDK ($VER)"
+          mkdir -p "$THEOS/sdks"
+          ln -sfn "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
+
+      - name: 编译
+        script: |
+          set -e
+          export THEOS=$HOME/theos
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)" package
+          make ipa
+          ls -lh WQLApp.ipa
+
+    artifacts:
+      - WQLApp.ipa

@@ -1,17 +1,19 @@
 #import "WQLLog.h"
 #import <stdarg.h>
+#import <stdio.h>
 #import <time.h>
 
 static NSString *gLogPath = nil;
-static dispatch_queue_t gLogQueue = NULL;
+static NSLock *gLogLock = nil;
 
 static void WQLLogSetup(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                              NSUserDomainMask, YES).firstObject;
+        if (!docs.length) docs = NSTemporaryDirectory();
         gLogPath = [docs stringByAppendingPathComponent:@"wql.log"];
-        gLogQueue = dispatch_queue_create("wql.log.queue", DISPATCH_QUEUE_SERIAL);
+        gLogLock = [NSLock new];
     });
 }
 
@@ -22,10 +24,11 @@ NSString *WQLLogFilePath(void) {
 
 void WQLLogReset(void) {
     WQLLogSetup();
-    dispatch_async(gLogQueue, ^{
-        [[NSFileManager defaultManager] removeItemAtPath:gLogPath error:nil];
-        [[NSFileManager defaultManager] removeItemAtPath:[gLogPath stringByAppendingString:@".1"] error:nil];
-    });
+    [gLogLock lock];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:gLogPath error:nil];
+    [fm removeItemAtPath:[gLogPath stringByAppendingString:@".1"] error:nil];
+    [gLogLock unlock];
 }
 
 void WQLLogLine(NSString *fmt, ...) {
@@ -37,29 +40,44 @@ void WQLLogLine(NSString *fmt, ...) {
     NSLog(@"[WQL] %@", msg);
 
     WQLLogSetup();
+
     time_t t = time(NULL);
     struct tm tmv;
     localtime_r(&t, &tmv);
-    char ts[16];
-    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
-    NSString *line = [NSString stringWithFormat:@"[%s] %@\n", ts, msg];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    char ts[32];
+    strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
 
-    dispatch_async(gLogQueue, ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSDictionary *attr = [fm attributesOfItemAtPath:gLogPath error:nil];
-        if ([attr[NSFileSize] unsignedLongLongValue] > 2ULL * 1024 * 1024) {
-            NSString *old = [gLogPath stringByAppendingString:@".1"];
-            [fm removeItemAtPath:old error:nil];
-            [fm moveItemAtPath:gLogPath toPath:old error:nil];
-        }
-        if (![fm fileExistsAtPath:gLogPath]) {
-            [data writeToFile:gLogPath atomically:YES];
-        } else {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-            [fh closeFile];
-        }
-    });
+    // 同步写 + fflush：进程被系统杀掉或崩溃时，已打印的行不会丢
+    [gLogLock lock];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attr = [fm attributesOfItemAtPath:gLogPath error:nil];
+    if ([attr[NSFileSize] unsignedLongLongValue] > 2ULL * 1024 * 1024) {
+        NSString *old = [gLogPath stringByAppendingString:@".1"];
+        [fm removeItemAtPath:old error:nil];
+        [fm moveItemAtPath:gLogPath toPath:old error:nil];
+    }
+
+    FILE *fp = fopen(gLogPath.fileSystemRepresentation, "a");
+    if (fp) {
+        fprintf(fp, "[%s] %s\n", ts, msg.UTF8String);
+        fflush(fp);
+        fclose(fp);
+    }
+
+    [gLogLock unlock];
+}
+
+#pragma mark - 崩溃兜底
+
+static void WQLLogHandleException(NSException *e) {
+    WQLLogLine(@"!!! 未捕获异常 name=%@ reason=%@", e.name, e.reason);
+    for (NSString *line in e.callStackSymbols) {
+        WQLLogLine(@"    %@", line);
+    }
+}
+
+void WQLLogInstallCrashHandler(void) {
+    NSSetUncaughtExceptionHandler(&WQLLogHandleException);
+    WQLLogLine(@"崩溃兜底已安装（覆盖 ObjC 异常，不覆盖 SIGSEGV）");
 }

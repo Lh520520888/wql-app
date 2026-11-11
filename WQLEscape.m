@@ -1,4 +1,5 @@
 #import "WQLEscape.h"
+#import "WQLLog.h"
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <sys/stat.h>
@@ -209,6 +210,7 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     // 目标必须存在
     struct stat st;
     if (lstat(path.fileSystemRepresentation, &st) != 0) {
+        WQLLogLine(@"escape: 目标不存在 %@", path);
         if (error) *error = [NSString stringWithFormat:@"目标不存在: %@", path];
         return WQLStatusTargetMissing;
     }
@@ -230,6 +232,8 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
         return WQLStatusNoGroup;
     }
     NSString *caches = [[root URLByAppendingPathComponent:@"Library/Caches"] path];
+    WQLLogLine(@"escape: target=%@ group=%@ groupRoot=%@",
+               target, group, root.path);
 
     // 符号链接替换是全局状态，必须串行
     [self.lock lock];
@@ -249,13 +253,19 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     uint64_t second = (first == kFlagAlt) ? kFlagDefault : kFlagAlt;
 
     int64_t handle = [self runQueryForGroup:group flags:first];
+    WQLLogLine(@"escape: flags=0x%llx → %lld",
+               (unsigned long long)first, (long long)handle);
     if (handle == WQLStatusQueryRejected || handle == WQLStatusTokenRefused) {
         int64_t retry = [self runQueryForGroup:group flags:second];
+        WQLLogLine(@"escape: flags=0x%llx → %lld",
+                   (unsigned long long)second, (long long)retry);
         if (retry > 0) handle = retry;
     }
 
     [self restoreCaches:caches];
     [self.lock unlock];
+
+    WQLLogLine(@"escape: 结果 %@ (target=%@)", [self describeStatus:handle], target);
 
     if (handle < 0 && error) {
         *error = [NSString stringWithFormat:@"%@ (target=%@)", [self describeStatus:handle], target];

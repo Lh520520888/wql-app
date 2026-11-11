@@ -4,3 +4,4 @@ packages/
 *.ipa
 .DS_Store
 build/
+uploads/

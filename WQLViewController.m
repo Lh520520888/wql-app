@@ -4,18 +4,23 @@
 #import "WQLPathLeak.h"
 #import "WQLKeepAlive.h"
 #import "WQLLog.h"
+#import "WQLUploader.h"
+#import <dispatch/dispatch.h>
 
 @interface WQLViewController ()
 
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITextView *logView;
+@property (nonatomic, strong) UITextField *endpointField;
 @property (nonatomic, strong) UIButton *scanButton;
 @property (nonatomic, strong) UIButton *stopButton;
+@property (nonatomic, copy) NSString *lastOutDir;
 
 @property (nonatomic, strong) WQLScanner *scanner;
 @property (nonatomic, assign) BOOL scanning;
 @property (nonatomic, assign) BOOL stopRequested;
 @property (nonatomic, assign) NSUInteger logLines;
+@property (nonatomic, assign) NSUInteger busyDepth;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 
 @end
@@ -29,6 +34,11 @@
     _bgTask = UIBackgroundTaskInvalid;
 
     [self buildUI];
+
+    NSString *ep = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLUploadEndpoint"];
+    if (!ep.length) ep = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WQLUploadEndpoint"];
+    self.endpointField.text = ep ?: @"";
+
     [self logText:@"WQL 通道就绪（仅用户态，无内核）"];
     [self refreshStatus];
 }
@@ -46,14 +56,33 @@
     self.scanButton = [self buttonWithTitle:@"开始扫描" action:@selector(onScan)];
     self.stopButton = [self buttonWithTitle:@"停止" action:@selector(onStop)];
     self.stopButton.enabled = NO;
+    UIButton *uploadButton = [self buttonWithTitle:@"上传" action:@selector(onUpload)];
+    UIButton *probeButton = [self buttonWithTitle:@"测试上传" action:@selector(onUploadProbe)];
     UIButton *shareButton = [self buttonWithTitle:@"分享日志" action:@selector(onShare)];
 
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:
-                            @[diagButton, self.scanButton, self.stopButton, shareButton]];
-    buttons.axis = UILayoutConstraintAxisHorizontal;
-    buttons.distribution = UIStackViewDistributionFillEqually;
+    UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[diagButton, self.scanButton, self.stopButton]];
+    UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[uploadButton, probeButton, shareButton]];
+    for (UIStackView *row in @[row1, row2]) {
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.distribution = UIStackViewDistributionFillEqually;
+        row.spacing = 8;
+    }
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2]];
+    buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 8;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.endpointField = [UITextField new];
+    self.endpointField.placeholder = @"上传地址 https://.../upload（留空则不上传）";
+    self.endpointField.font = [UIFont systemFontOfSize:12];
+    self.endpointField.borderStyle = UITextBorderStyleRoundedRect;
+    self.endpointField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.endpointField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.endpointField.keyboardType = UIKeyboardTypeURL;
+    self.endpointField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.endpointField.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.logView = [UITextView new];
     self.logView.editable = NO;
@@ -66,6 +95,7 @@
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
 
     [self.view addSubview:self.statusLabel];
+    [self.view addSubview:self.endpointField];
     [self.view addSubview:buttons];
     [self.view addSubview:self.logView];
 
@@ -75,10 +105,15 @@
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
 
-        [buttons.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:12],
+        [self.endpointField.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:10],
+        [self.endpointField.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [self.endpointField.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [self.endpointField.heightAnchor constraintEqualToConstant:34],
+
+        [buttons.topAnchor constraintEqualToAnchor:self.endpointField.bottomAnchor constant:8],
         [buttons.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [buttons.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-        [buttons.heightAnchor constraintEqualToConstant:40],
+        [buttons.heightAnchor constraintEqualToConstant:88],
 
         [self.logView.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
@@ -178,21 +213,9 @@
     self.scanButton.enabled = NO;
     self.stopButton.enabled = YES;
 
-    // 后台保活：静音音频让进程不被挂起，外加系统给的 30 秒宽限期兜底
-    BOOL alive = [[WQLKeepAlive shared] start];
-    [self logText:alive ? @"后台保活已开启：划到后台 / 锁屏仍会继续扫描"
-                          : @"后台保活未开启：切到后台约 30 秒后会被系统挂起"];
+    [self beginBusy];
 
-    __weak typeof(self) weakVC = self;
-    self.bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"wql.scan"
-                                                              expirationHandler:^{
-        __strong typeof(weakVC) vc = weakVC;
-        if (!vc) return;
-        if (vc.bgTask != UIBackgroundTaskInvalid) {
-            [[UIApplication sharedApplication] endBackgroundTask:vc.bgTask];
-            vc.bgTask = UIBackgroundTaskInvalid;
-        }
-    }];
+    [self cleanupOldOutputsKeeping:3];
 
     NSString *stamp = [NSDateFormatter localizedStringFromDate:[NSDate date]
                                                      dateStyle:NSDateFormatterShortStyle
@@ -218,6 +241,7 @@
     };
 
     [self logText:[NSString stringWithFormat:@"输出目录: %@", outDir]];
+    self.lastOutDir = outDir;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [scanner scanWithOutputDirectory:outDir];
@@ -225,14 +249,164 @@
             self.scanning = NO;
             self.scanButton.enabled = YES;
             self.stopButton.enabled = NO;
-            [[WQLKeepAlive shared] stop];
-            if (self.bgTask != UIBackgroundTaskInvalid) {
-                [[UIApplication sharedApplication] endBackgroundTask:self.bgTask];
-                self.bgTask = UIBackgroundTaskInvalid;
-            }
             [self logText:@"扫描结束"];
+
+            // 配了上传地址就自动上传；上传期间继续持有保活，传完才释放
+            if (self.endpointField.text.length) {
+                [self onUploadWithCompletion:^{
+                    [self endBusy];
+                }];
+            } else {
+                [self endBusy];
+            }
         });
     });
+}
+
+- (NSString *)currentEndpoint {
+    return [self.endpointField.text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (WQLUploader *)configuredUploader {
+    NSString *ep = [self currentEndpoint];
+    if (!ep.length) {
+        [self logText:@"未填上传地址"];
+        return nil;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:ep forKey:@"WQLUploadEndpoint"];
+
+    WQLUploader *up = [WQLUploader shared];
+    up.endpoint = ep;
+    up.maxFileBytes = 64ULL * 1024 * 1024;
+
+    __weak typeof(self) weakSelf = self;
+    up.logBlock = ^(NSString *line) {
+        [weakSelf appendLog:line];
+    };
+    return up;
+}
+
+- (void)uploadDirectory:(NSString *)dir
+                  label:(NSString *)label
+             completion:(void (^)(void))done {
+    WQLUploader *up = [self configuredUploader];
+    if (!up) {
+        if (done) done();
+        return;
+    }
+
+    [self logText:[NSString stringWithFormat:@"开始上传(%@): %@", label, dir]];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [up uploadDirectory:dir completion:^(NSUInteger ok, NSUInteger failed) {
+            [weakSelf logText:[NSString stringWithFormat:
+                               @"上传完成：成功 %lu / 失败 %lu",
+                               (unsigned long)ok, (unsigned long)failed]];
+            if (done) done();
+        }];
+    });
+}
+
+- (void)onUpload {
+    [self onUploadWithCompletion:nil];
+}
+
+- (void)onUploadWithCompletion:(void (^)(void))done {
+    NSString *dir = self.lastOutDir;
+    if (!dir.length || ![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+        [self logText:@"还没有可上传的采集结果，先点「开始扫描」"];
+        if (done) done();
+        return;
+    }
+    [self beginBusy];
+    [self uploadDirectory:dir label:@"采集结果" completion:^{
+        [self endBusy];
+        if (done) done();
+    }];
+}
+
+/// 不依赖漏洞通道，造一个测试文件走完整上传链路
+- (void)onUploadProbe {
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"wql_probe_%@", NSUUID.UUID.UUIDString]];
+    NSString *docsDir = [dir stringByAppendingPathComponent:@"com.wql.probe/Documents"];
+    NSString *file = [docsDir stringByAppendingPathComponent:@"probe.txt"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:docsDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *content = [NSString stringWithFormat:
+                         @"wql upload probe\napp=%@\ntime=%@\n",
+                         [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
+                         [NSDate date]];
+    [content writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    [self logText:[NSString stringWithFormat:@"已生成测试文件: %@", file]];
+    [self beginBusy];
+    [self uploadDirectory:dir label:@"测试" completion:^{
+        [self endBusy];
+    }];
+}
+
+#pragma mark - 保活（扫描/上传共用，按引用计数）
+
+- (void)beginBusy {
+    self.busyDepth += 1;
+    if (self.busyDepth > 1) return;
+
+    BOOL alive = [[WQLKeepAlive shared] start];
+    [self logText:alive ? @"后台保活已开启：划到后台 / 锁屏仍会继续"
+                        : @"后台保活未开启：切到后台约 30 秒后会被挂起"];
+
+    __weak typeof(self) weakVC = self;
+    self.bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"wql.busy"
+                                                              expirationHandler:^{
+        __strong typeof(weakVC) vc = weakVC;
+        if (!vc) return;
+        if (vc.bgTask != UIBackgroundTaskInvalid) {
+            [[UIApplication sharedApplication] endBackgroundTask:vc.bgTask];
+            vc.bgTask = UIBackgroundTaskInvalid;
+        }
+    }];
+}
+
+- (void)endBusy {
+    if (self.busyDepth == 0) return;
+    self.busyDepth -= 1;
+    if (self.busyDepth > 0) return;
+
+    [[WQLKeepAlive shared] stop];
+    if (self.bgTask != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:self.bgTask];
+        self.bgTask = UIBackgroundTaskInvalid;
+    }
+}
+
+#pragma mark - 旧产物清理
+
+- (void)cleanupOldOutputsKeeping:(NSUInteger)keep {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *root = [docs stringByAppendingPathComponent:@"wql_out"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSArray *items = [fm contentsOfDirectoryAtPath:root error:nil];
+    if (items.count <= keep) return;
+
+    NSArray *sorted = [items sortedArrayUsingSelector:@selector(compare:)];
+    NSUInteger removeCount = sorted.count - keep;
+    NSUInteger removed = 0;
+    for (NSUInteger i = 0; i < removeCount; i++) {
+        NSString *p = [root stringByAppendingPathComponent:sorted[i]];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
+            if ([fm removeItemAtPath:p error:nil]) removed++;
+        }
+    }
+    if (removed) {
+        [self logText:[NSString stringWithFormat:@"清理旧采集目录 %lu 个",
+                       (unsigned long)removed]];
+    }
 }
 
 - (void)onStop {

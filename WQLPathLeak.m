@@ -55,7 +55,11 @@ typedef struct {
                                                                  maxInode:(uint64_t)maxInode
                                                                  progress:(void (^)(uint64_t, uint64_t))progress
                                                                    cancel:(BOOL (^)(void))cancel
+                                                                completed:(BOOL *)completed
                                                                     error:(NSString **)error {
+    BOOL wasCancelled = NO;
+    if (completed) *completed = NO;
+
     NSMutableDictionary *buckets = [NSMutableDictionary dictionary];
     if (!directories.count) {
         if (error) *error = @"没有目标目录";
@@ -105,7 +109,7 @@ typedef struct {
         char buf[PATH_MAX];
         for (uint64_t ino = 1; ino <= maxInode; ino++) {
             if ((ino & 0x3FFF) == 0) {
-                if (cancel && cancel()) break;
+                if (cancel && cancel()) { wasCancelled = YES; break; }
                 if (progress) progress(totalDone + ino, maxInode * byVolume.count);
                 @autoreleasepool { }
             }
@@ -135,6 +139,7 @@ typedef struct {
     }
 
     if (progress) progress(totalDone, totalDone);
+    if (completed) *completed = !wasCancelled;
 
     // 去重后返回不可变数组
     NSMutableDictionary *out = [NSMutableDictionary dictionary];

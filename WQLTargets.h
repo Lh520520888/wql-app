@@ -26,6 +26,11 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable WQLTarget *)matchBundleID:(NSString *)bundleID
                             inTargets:(NSArray<WQLTarget *> *)targets;
 
+/// 同上，fuzzy 输出是否走了模糊匹配（模糊命中容易误伤，调用方应记录）
++ (nullable WQLTarget *)matchBundleID:(NSString *)bundleID
+                            inTargets:(NSArray<WQLTarget *> *)targets
+                                fuzzy:(BOOL *_Nullable)fuzzy;
+
 @end
 
 NS_ASSUME_NONNULL_END

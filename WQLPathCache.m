@@ -1,4 +1,5 @@
 #import "WQLPathCache.h"
+#import <dispatch/dispatch.h>
 
 @interface WQLPathCache ()
 @property (nonatomic, copy) NSString *filePath;

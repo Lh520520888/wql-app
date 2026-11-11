@@ -16,7 +16,9 @@ WQLApp_FILES = \
 	WQLPathCache.m \
 	WQLKeepAlive.m \
 	WQLTargets.m \
-	WQLScanner.m
+	WQLScanner.m \
+	WQLUploader.m \
+	WQLZip.m
 
 WQLApp_FRAMEWORKS = UIKit Foundation AVFoundation
 WQLApp_RESOURCE_DIRS = Resources

@@ -2,6 +2,8 @@
 #import "WQLLog.h"
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <errno.h>
+#import <string.h>
 #import <sys/stat.h>
 #import <sys/mount.h>
 #import <sys/sysctl.h>
@@ -48,6 +50,8 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
 - (uint64_t)preferredFlag;
 - (NSString *)deviceModel;
 - (int64_t)runQueryForGroup:(NSString *)group flags:(uint64_t)flags;
+- (BOOL)swapCachesAtPath:(NSString *)caches toSymlink:(NSString *)target error:(NSError **)error;
+- (BOOL)restoreCaches:(NSString *)caches;
 @end
 
 @implementation WQLEscape
@@ -207,11 +211,16 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     }
     if (![self prepareWithError:error]) return WQLStatusSymbolsMissing;
 
-    // 目标必须存在
+    // 目标必须存在（区分“不存在”和“没权限”，否则日志会误导）
     struct stat st;
+    errno = 0;
     if (lstat(path.fileSystemRepresentation, &st) != 0) {
-        WQLLogLine(@"escape: 目标不存在 %@", path);
-        if (error) *error = [NSString stringWithFormat:@"目标不存在: %@", path];
+        int e = errno;
+        WQLLogLine(@"escape: lstat 失败 %@ errno=%d(%s)", path, e, strerror(e));
+        if (error) {
+            *error = [NSString stringWithFormat:@"lstat 失败 errno=%d(%s): %@",
+                      e, strerror(e), path];
+        }
         return WQLStatusTargetMissing;
     }
 
@@ -238,10 +247,8 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     // 符号链接替换是全局状态，必须串行
     [self.lock lock];
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm removeItemAtPath:caches error:nil];
     NSError *symErr = nil;
-    if (![fm createSymbolicLinkAtPath:caches withDestinationPath:target error:&symErr]) {
+    if (![self swapCachesAtPath:caches toSymlink:target error:&symErr]) {
         [self restoreCaches:caches];
         [self.lock unlock];
         if (error) *error = [NSString stringWithFormat:@"建符号链接失败: %@",
@@ -304,10 +311,56 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     return out;
 }
 
-- (void)restoreCaches:(NSString *)caches {
+- (BOOL)swapCachesAtPath:(NSString *)caches toSymlink:(NSString *)target error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
-    [fm removeItemAtPath:caches error:nil];
-    [fm createDirectoryAtPath:caches withIntermediateDirectories:NO attributes:nil error:nil];
+    NSString *tmp = [caches stringByAppendingFormat:@".wql_%@", NSUUID.UUID.UUIDString];
+    [fm removeItemAtPath:tmp error:nil];
+
+    if (![fm createSymbolicLinkAtPath:tmp withDestinationPath:target error:error]) {
+        return NO;
+    }
+
+    // 原 Caches 不存在：直接挪过去
+    if (![fm fileExistsAtPath:caches]) {
+        BOOL ok = [fm moveItemAtPath:tmp toPath:caches error:error];
+        if (!ok) [fm removeItemAtPath:tmp error:nil];
+        return ok;
+    }
+
+    // 原子替换：失败时原 Caches 原样保留，不会像“先删再建”那样丢数据
+    BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:caches]
+                   withItemAtURL:[NSURL fileURLWithPath:tmp]
+                  backupItemName:nil
+                         options:0
+                resultingItemURL:NULL
+                           error:error];
+    if (!ok) [fm removeItemAtPath:tmp error:nil];
+    return ok;
+}
+
+- (BOOL)restoreCaches:(NSString *)caches {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *tmp = [caches stringByAppendingFormat:@".wql_%@", NSUUID.UUID.UUIDString];
+    [fm removeItemAtPath:tmp error:nil];
+
+    if (![fm createDirectoryAtPath:tmp withIntermediateDirectories:NO attributes:nil error:nil]) {
+        return NO;
+    }
+
+    if ([fm fileExistsAtPath:caches]) {
+        BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:caches]
+                       withItemAtURL:[NSURL fileURLWithPath:tmp]
+                      backupItemName:nil
+                             options:0
+                    resultingItemURL:NULL
+                               error:nil];
+        if (!ok) [fm removeItemAtPath:tmp error:nil];
+        return ok;
+    }
+
+    BOOL ok = [fm moveItemAtPath:tmp toPath:caches error:nil];
+    if (!ok) [fm removeItemAtPath:tmp error:nil];
+    return ok;
 }
 
 - (void)releaseHandle:(int64_t)handle {

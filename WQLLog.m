@@ -1,4 +1,5 @@
 #import "WQLLog.h"
+#import <dispatch/dispatch.h>
 #import <stdarg.h>
 #import <stdio.h>
 #import <time.h>

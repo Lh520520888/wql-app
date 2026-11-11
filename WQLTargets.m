@@ -101,9 +101,31 @@
 }
 
 + (WQLTarget *)matchBundleID:(NSString *)bundleID inTargets:(NSArray<WQLTarget *> *)targets {
+    return [self matchBundleID:bundleID inTargets:targets fuzzy:NULL];
+}
+
++ (WQLTarget *)matchBundleID:(NSString *)bundleID
+                   inTargets:(NSArray<WQLTarget *> *)targets
+                       fuzzy:(BOOL *)fuzzy {
+    if (fuzzy) *fuzzy = NO;
     if (!bundleID.length) return nil;
+
+    NSString *lower = bundleID.lowercaseString;
+
+    // 先精确匹配，命中就不算模糊
     for (WQLTarget *t in targets) {
-        if ([t matchesBundleID:bundleID]) return t;
+        for (NSString *bid in t.bundleIDs) {
+            if ([bid.lowercaseString isEqualToString:lower]) return t;
+        }
+    }
+    // 再模糊
+    for (WQLTarget *t in targets) {
+        for (NSString *f in t.fuzzyIDs) {
+            if ([lower containsString:f.lowercaseString]) {
+                if (fuzzy) *fuzzy = YES;
+                return t;
+            }
+        }
     }
     return nil;
 }

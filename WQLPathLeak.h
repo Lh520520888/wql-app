@@ -21,10 +21,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param maxInode    inode 上界，传 0 表示自动取基线
 /// @param progress    进度回调 (已扫描, 总数)，每 16384 个 inode 一次
 /// @param cancel      返回 YES 则中止，返回已扫到的结果
+/// @param completed   输出参数：是否完整扫完（被取消时为 NO，调用方不能拿它写缓存）
 + (NSDictionary<NSString *, NSArray<NSString *> *> *)childrenOfDirectories:(NSArray<NSString *> *)directories
                                                                  maxInode:(uint64_t)maxInode
                                                                  progress:(void (^_Nullable)(uint64_t, uint64_t))progress
                                                                    cancel:(BOOL (^_Nullable)(void))cancel
+                                                                completed:(BOOL *_Nullable)completed
                                                                     error:(NSString *_Nullable *_Nullable)error;
 
 @end

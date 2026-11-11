@@ -17,9 +17,11 @@ typedef struct {
     __unsafe_unretained NSString *key;   // ARC 下结构体里只能放非持有引用
 } wql_prefix_t;
 
-@implementation WQLPathLeak
-
+@interface WQLPathLeak ()
 + (NSString *)trimmedPath:(NSString *)p;
+@end
+
+@implementation WQLPathLeak
 
 + (BOOL)prepareWithError:(NSString **)error {
     if (gFSGetPath) return YES;

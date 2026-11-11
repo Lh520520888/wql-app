@@ -2,35 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- 本通道不需要伪装 MobileHouseArrest，application-identifier 用普通值即可。
-	     签名工具通常会按自己的证书重写这两项；若工具要求与描述文件 AppID 完全一致，
-	     把 Info.plist 的 CFBundleIdentifier 改成 com.rails.mobile.MobilePlatform。 -->
-	<key>application-identifier</key>
-	<string>582WZMYB2P.com.wql.app</string>
-
-	<key>com.apple.developer.team-identifier</key>
-	<string>582WZMYB2P</string>
-
-	<key>get-task-allow</key>
-	<false/>
-
-	<!-- 整个漏洞的前提：必须真实拥有一个 App Group 容器。
-	     这里的值必须与描述文件里 com.apple.security.application-groups 完全一致，
-	     否则 containerURLForSecurityApplicationGroupIdentifier 返回 nil，通道直接断在 -1。
-
-	     当前填的是工作区里唯一带 App Group 的企业描述文件：
-	       Name        = dis-MobilePlatform
-	       TeamName    = China Academy of Railway Sciences (582WZMYB2P)
-	       ProvisionsAllDevices = true
-	       ExpirationDate       = 2027-04-02
-	       application-groups   = group.com.rails.mobilePlatform
-	     星耀国际那套（Chengdu Railway Bureau / zhctAppProfile）里没有这一项，签了也跑不起来。 -->
+	<!-- 唯一的硬需求：App Group 必须与描述文件里完全一致。
+	     最终签名（全能签/超级签）会用描述文件里的 entitlements 覆盖这里，
+	     所以这里只保留真正需要的那一项，避免写入错误的 team id 干扰签名工具。 -->
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.rails.mobilePlatform</string>
+		<string>group.com.wql.app</string>
 	</array>
 
 	<key>com.apple.developer.default-data-protection</key>
 	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
+
+	<key>get-task-allow</key>
+	<false/>
 </dict>
 </plist>

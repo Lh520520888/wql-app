@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.wql.app</string>
+	<key>CFBundleDisplayName</key>
+	<string>WQL</string>
+	<key>CFBundleName</key>
+	<string>WQLApp</string>
+	<key>CFBundleExecutable</key>
+	<string>WQLApp</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>15.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<!-- 让抓到的文件能直接从「文件」App 里取出来 -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+
+	<!-- 本 App 自己的 App Group。必须与 entitlements.plist 和描述文件里的值完全一致，
+	     否则 containerURLForSecurityApplicationGroupIdentifier 返回 nil，整条通道走不通。 -->
+	<key>WQLAppGroup</key>
+	<string>group.com.rails.mobilePlatform</string>
+
+	<!-- 单容器拷贝门限（字节），超过则跳过并记日志 -->
+	<key>WQLMaxContainerBytes</key>
+	<integer>838860800</integer>
+</dict>
+</plist>

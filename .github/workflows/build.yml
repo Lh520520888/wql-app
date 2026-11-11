@@ -1,0 +1,43 @@
+name: build-wqlapp
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 安装 Theos
+        run: |
+          brew install ldid xz 2>/dev/null || true
+          export THEOS=$HOME/theos
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "SDK: $SDK ($VER)"
+          mkdir -p "$THEOS/sdks"
+          ln -sfn "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
+
+      - name: 编译
+        run: |
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)" package
+          make ipa
+          ls -lh WQLApp.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WQLApp-ipa
+          path: WQLApp.ipa
+          if-no-files-found: error

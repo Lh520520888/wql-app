@@ -7,7 +7,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 用 Intel 镜像：私有仓库上的 macos-14 会被解析成 arm64 配置，部分账号不支持
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 

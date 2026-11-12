@@ -80,7 +80,6 @@ static const uint64_t kCheckpointEvery = 500000ULL;
                                                                 completed:(BOOL *)completed
                                                                     error:(NSString **)error {
     BOOL wasCancelled = NO;
-    uint64_t startInode = 1;
     if (completed) *completed = NO;
 
     NSMutableDictionary *buckets = [NSMutableDictionary dictionary];
@@ -90,19 +89,27 @@ static const uint64_t kCheckpointEvery = 500000ULL;
     }
     if (![self prepareWithError:error]) return buckets;
 
+    // 断点必须「按卷」记录：多个卷共用一个 nextInode，会让后一个卷跳过前半段
+    NSMutableDictionary<NSString *, NSNumber *> *resumeVolumes = [NSMutableDictionary dictionary];
     NSMutableDictionary *resumeBuckets = nil;
     NSDictionary *cp = [NSDictionary dictionaryWithContentsOfFile:WQLLeakCheckpointPath()];
     if ([cp isKindOfClass:[NSDictionary class]] &&
+        [cp[@"v"] intValue] == 2 &&
         [cp[@"roots"] isEqual:directories] &&
         [cp[@"maxInode"] isKindOfClass:[NSNumber class]]) {
         double ts = [cp[@"ts"] doubleValue];
         if ([[NSDate date] timeIntervalSince1970] - ts < 72 * 3600) {
-            startInode = [cp[@"nextInode"] unsignedLongLongValue];
             maxInode = [cp[@"maxInode"] unsignedLongLongValue];
+            NSDictionary *pv = cp[@"volumes"];
+            if ([pv isKindOfClass:[NSDictionary class]]) {
+                for (NSString *k in pv) {
+                    if ([pv[k] isKindOfClass:[NSNumber class]]) resumeVolumes[k] = pv[k];
+                }
+            }
             NSDictionary *pb = cp[@"buckets"];
             if ([pb isKindOfClass:[NSDictionary class]]) resumeBuckets = [pb mutableCopy];
-            WQLLogLine(@"【续扫】上次停在 inode %llu（共 %llu），从这里继续",
-                       (unsigned long long)startInode, (unsigned long long)maxInode);
+            WQLLogLine(@"【续扫】断点里有 %lu 个卷的进度，按卷继续",
+                       (unsigned long)resumeVolumes.count);
         }
     }
 
@@ -130,21 +137,31 @@ static const uint64_t kCheckpointEvery = 500000ULL;
         }
     }
 
-    // 进度分母必须是「所有卷的跨度之和」，否则跨两个卷时百分比会冲到 200%
-    uint64_t from = (startInode > 0) ? startInode : 1;
-    uint64_t span = (maxInode >= from) ? (maxInode - from + 1) : 0;
-    uint64_t volCount = 0;
+    // 每个卷从自己的断点开始；分母是各卷剩余跨度之和，进度不会超过 100%
+    NSMutableDictionary<NSString *, NSNumber *> *volStart = [NSMutableDictionary dictionary];
+    uint64_t grandTotal = 0;
     for (NSString *vol in byVolume) {
         NSArray<NSString *> *dirs = byVolume[vol];
         NSString *first = dirs.firstObject;
         struct statfs t;
-        if (first && statfs(first.fileSystemRepresentation, &t) == 0) volCount++;
-    }
-    uint64_t grandTotal = span * volCount;
+        if (!first || statfs(first.fileSystemRepresentation, &t) != 0) continue;
 
+        uint64_t s = 1;
+        NSNumber *sv = resumeVolumes[vol];
+        if (sv) s = MAX((uint64_t)1, sv.unsignedLongLongValue);
+        volStart[vol] = @(s);
+        if (s <= maxInode) grandTotal += (maxInode - s + 1);
+    }
+
+    NSMutableDictionary<NSString *, NSNumber *> *volNext = [volStart mutableCopy];
     uint64_t totalDone = 0;
     for (NSString *vol in byVolume) {
         NSArray<NSString *> *dirs = byVolume[vol];
+        NSNumber *startNum = volStart[vol];
+        if (!startNum) continue;
+        uint64_t from = startNum.unsignedLongLongValue;
+        uint64_t span = (maxInode >= from) ? (maxInode - from + 1) : 0;
+        if (span == 0) continue;
 
         struct statfs sfs;
         if (statfs(dirs.firstObject.fileSystemRepresentation, &sfs) != 0) continue;
@@ -170,12 +187,14 @@ static const uint64_t kCheckpointEvery = 500000ULL;
             }
 
             if ((ino % kCheckpointEvery) == 0) {
+                volNext[vol] = @(ino + 1);
                 NSDictionary *ck = @{
+                    @"v": @(2),
                     @"roots": directories,
                     @"maxInode": @(maxInode),
-                    @"nextInode": @(ino + 1),
                     @"ts": @([[NSDate date] timeIntervalSince1970]),
                     @"buckets": buckets,
+                    @"volumes": volNext,
                 };
                 [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
             }

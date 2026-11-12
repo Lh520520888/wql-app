@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSArray<NSString *> *fuzzyIDs;     // 小写子串匹配
 @property (nonatomic, copy) NSArray<NSString *> *relativePaths; // 容器内相对路径（文件或目录）
 @property (nonatomic, assign) BOOL wholeContainer;             // 整个容器打包（Bitpie）
+@property (nonatomic, assign) uint64_t maxBytes;               // 本目标的体积上限，0 = 用全局门限
 
 - (BOOL)matchesBundleID:(NSString *)bundleID;
 
@@ -22,6 +23,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 不在目录内时也值得一并带走的系统/共享容器
 + (NSArray<WQLTarget *> *)extras;
+
+/// 备忘录：主库 + Accounts（含图片附件）。单独一组，默认不跟随 extras 走
++ (NSArray<WQLTarget *> *)notes;
 
 + (nullable WQLTarget *)matchBundleID:(NSString *)bundleID
                             inTargets:(NSArray<WQLTarget *> *)targets;

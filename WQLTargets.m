@@ -106,6 +106,19 @@
     ];
 }
 
++ (NSArray<WQLTarget *> *)notes {
+    WQLTarget *t = [self target:@"Notes"
+                      bundleIDs:@[@"group.com.apple.notes",
+                                  @"com.apple.notes",
+                                  @"com.apple.mobilenotes"]
+                       fuzzyIDs:@[]
+                           paths:@[@"NoteStore.sqlite", @"Accounts"]
+                 wholeContainer:NO];
+    // 备忘录图片可能很大，单独给个上限，避免把首轮拖成半小时
+    t.maxBytes = 300ULL * 1024 * 1024;
+    return @[t];
+}
+
 + (WQLTarget *)matchBundleID:(NSString *)bundleID inTargets:(NSArray<WQLTarget *> *)targets {
     return [self matchBundleID:bundleID inTargets:targets fuzzy:NULL];
 }

@@ -1,9 +1,12 @@
 #import "WQLPathCache.h"
 #import <dispatch/dispatch.h>
+#import <float.h>
 
 @interface WQLPathCache ()
 @property (nonatomic, copy) NSString *filePath;
+@property (nonatomic, copy) NSString *metaPath;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSArray<NSString *> *> *map;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *scannedAt;
 @end
 
 @implementation WQLPathCache
@@ -25,13 +28,32 @@
     [[NSFileManager defaultManager] createDirectoryAtPath:base
                               withIntermediateDirectories:YES attributes:nil error:nil];
     _filePath = [base stringByAppendingPathComponent:@"wql_paths.plist"];
+    _metaPath = [base stringByAppendingPathComponent:@"wql_paths_meta.plist"];
     _map = [NSMutableDictionary dictionary];
+    _scannedAt = [NSMutableDictionary dictionary];
 
     NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:_filePath];
     for (NSString *k in saved) {
         id v = saved[k];
         if ([v isKindOfClass:[NSArray class]]) _map[k] = v;
     }
+
+    NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:_metaPath];
+    for (NSString *k in meta) {
+        if ([meta[k] isKindOfClass:[NSNumber class]]) _scannedAt[k] = meta[k];
+    }
+}
+
+- (void)markRootScanned:(NSString *)root {
+    if (!root.length) return;
+    self.scannedAt[root] = @([[NSDate date] timeIntervalSince1970]);
+    [self.scannedAt writeToFile:self.metaPath atomically:YES];
+}
+
+- (NSTimeInterval)secondsSinceScanForRoot:(NSString *)root {
+    NSNumber *ts = self.scannedAt[root];
+    if (!ts) return DBL_MAX;
+    return [[NSDate date] timeIntervalSince1970] - ts.doubleValue;
 }
 
 - (NSArray<NSString *> *)validPathsForRoot:(NSString *)root {
@@ -65,7 +87,9 @@
 
 - (void)invalidate {
     [self.map removeAllObjects];
+    [self.scannedAt removeAllObjects];
     [[NSFileManager defaultManager] removeItemAtPath:self.filePath error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:self.metaPath error:nil];
 }
 
 - (void)save {

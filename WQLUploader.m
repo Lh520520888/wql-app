@@ -44,8 +44,8 @@
 
 - (NSString *)endpoint {
     if (_endpoint.length) return _endpoint;
-    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLUploadEndpoint"];
-    if (saved.length) return saved;
+    // 端点由 WQLViewController 在启动时注入（内置混淆值或调试覆盖），
+    // 这里不再读 UserDefaults，避免旧版本写进去的地址压过内置值。
     return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WQLUploadEndpoint"];
 }
 

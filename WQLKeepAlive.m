@@ -104,27 +104,18 @@
 
 - (void)watchdogTick {
     if (!self.running) return;
+    if (self.player.isPlaying) return;
 
+    // 播放器停了就重建；会话顺手重激活（setActive 是幂等的）
     AVAudioSession *s = [AVAudioSession sharedInstance];
-    BOOL sessionOK = s.isActive;
-    BOOL playing = self.player.isPlaying;
-
-    if (sessionOK && playing) return;
-
-    // 会话被系统踢掉，或播放器停了：重建，而不是只 setActive
     NSError *err = nil;
-    if (!sessionOK) [s setActive:YES error:&err];
-    if (!playing) {
-        if (![self buildPlayer]) {
-            WQLLogLine(@"保活自愈失败（重建播放器失败）");
-            return;
-        }
+    [s setActive:YES error:&err];
+    if (![self buildPlayer]) {
+        WQLLogLine(@"保活自愈失败（重建播放器失败：%@）", err.localizedDescription ?: @"unknown");
+        return;
     }
     self.recoveries++;
-    WQLLogLine(@"保活自愈 #%lu（session=%@，player=%@）",
-               (unsigned long)self.recoveries,
-               sessionOK ? @"ok" : @"inactive",
-               playing ? @"ok" : @"stopped");
+    WQLLogLine(@"保活自愈 #%lu：播放器已重建", (unsigned long)self.recoveries);
 }
 
 - (void)rearm {
@@ -134,7 +125,7 @@
 - (void)rearmWithReason:(NSString *)reason {
     if (!self.running) return;
     AVAudioSession *s = [AVAudioSession sharedInstance];
-    if (!s.isActive) [s setActive:YES error:nil];
+    [s setActive:YES error:nil];
     if (!self.player.isPlaying) {
         if (![self.player play]) [self buildPlayer];
     }

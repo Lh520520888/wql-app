@@ -21,6 +21,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 清掉断点（下次从头扫）
 + (void)clearCheckpoint;
 
+/// 调试用：断点概况（按卷的进度、保存时间）
++ (NSString *)checkpointSummary;
+
 /// 一次遍历，返回 dir -> 直接子项数组（同时通过 onPath 逐个回调）。
 /// @param maxInode  0 = 自动取基线，并从断点续扫
 /// @param onPath    每发现一个直接子项回调一次（在扫描线程上同步执行）

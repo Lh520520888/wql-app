@@ -42,6 +42,33 @@ static const uint64_t kCheckpointEvery = 500000ULL;
     [[NSFileManager defaultManager] removeItemAtPath:WQLLeakCheckpointPath() error:nil];
 }
 
++ (NSString *)checkpointSummary {
+    NSDictionary *cp = [NSDictionary dictionaryWithContentsOfFile:WQLLeakCheckpointPath()];
+    if (![cp isKindOfClass:[NSDictionary class]] || ![cp[@"v"] intValue]) {
+        return @"断点：无";
+    }
+
+    double age = [[NSDate date] timeIntervalSince1970] - [cp[@"ts"] doubleValue];
+    NSMutableString *s = [NSMutableString stringWithFormat:
+                          @"断点：%.1f 分钟前保存，maxInode=%llu",
+                          age / 60.0,
+                          [cp[@"maxInode"] unsignedLongLongValue]];
+    NSDictionary *vols = cp[@"volumes"];
+    if ([vols isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in [[vols allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+            [s appendFormat:@"\n    · 卷 %@ → 从 inode %llu 继续",
+             k, [vols[k] unsignedLongLongValue]];
+        }
+    }
+    NSDictionary *buckets = cp[@"buckets"];
+    if ([buckets isKindOfClass:[NSDictionary class]]) {
+        NSUInteger n = 0;
+        for (NSString *k in buckets) n += [buckets[k] count];
+        [s appendFormat:@"\n    · 已找到 %lu 条路径", (unsigned long)n];
+    }
+    return s;
+}
+
 + (BOOL)prepareWithError:(NSString **)error {
     if (gFSGetPath) return YES;
     void *h = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW | RTLD_LOCAL);

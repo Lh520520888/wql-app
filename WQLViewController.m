@@ -2,6 +2,7 @@
 #import "WQLEscape.h"
 #import "WQLScanner.h"
 #import "WQLPathLeak.h"
+#import "WQLPathCache.h"
 #import "WQLKeepAlive.h"
 #import "WQLLog.h"
 #import "WQLUploader.h"
@@ -31,6 +32,7 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, strong) UIButton *stopButton;
 @property (nonatomic, copy) NSString *lastOutDir;
 @property (nonatomic, copy) NSString *activeEndpoint;
+@property (nonatomic, copy) NSString *statusBase;
 
 @property (nonatomic, strong) WQLScanner *scanner;
 @property (nonatomic, assign) BOOL scanning;
@@ -49,6 +51,10 @@ static NSString *WQLBuiltinEndpoint(void) {
 - (void)saveEndpointOverride;
 - (void)setStatus:(NSString *)text;
 - (void)flushPendingIfPossible;
+- (void)onShowState;
+- (void)onFlushPendingNow;
+- (void)onResetFirstRun;
+- (void)onClearAndFullScan;
 
 @end
 
@@ -61,6 +67,10 @@ static NSString *WQLBuiltinEndpoint(void) {
     _bgTask = UIBackgroundTaskInvalid;
 
     [self buildUI];
+    // 调试期：所有工具默认可见、地址可改；正式版把这里改成 NO 即可
+    self.debugUnlocked = YES;
+    self.stopButton.hidden = NO;
+    self.endpointField.enabled = YES;
     [self loadEndpoint];
 
     // 重启后「上传」按钮还能用：把上次的输出目录接回来
@@ -91,7 +101,7 @@ static NSString *WQLBuiltinEndpoint(void) {
     // 老版本「每次上传都往 UserDefaults 写地址」，这里清掉，避免它压过内置值
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"WQLUploadEndpoint"];
 
-    self.endpointField.enabled = NO;
+    self.endpointField.enabled = self.debugUnlocked;
     self.endpointField.text = self.debugUnlocked ? self.activeEndpoint
                                                  : [self maskedEndpoint:self.activeEndpoint];
 }
@@ -195,8 +205,78 @@ static NSString *WQLBuiltinEndpoint(void) {
 
 - (void)setStatus:(NSString *)text {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.text = text;
+        // 保留顶部那三行静态信息，下面追加运行态
+        if (self.statusBase.length) {
+            self.statusLabel.text = [NSString stringWithFormat:@"%@\n%@", self.statusBase, text];
+        } else {
+            self.statusLabel.text = text;
+        }
     });
+}
+
+#pragma mark - 调试动作
+
+- (void)onShowState {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    BOOL firstDone = [d boolForKey:@"WQLFirstRunDone"];
+    BOOL interrupted = [d boolForKey:@"WQLScanInterrupted"];
+    double last = [d doubleForKey:@"WQLLastScanEnd"];
+    NSString *lastStr = @"从未完成";
+    if (last > 0) {
+        lastStr = [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:last]
+                                                dateStyle:NSDateFormatterShortStyle
+                                                timeStyle:NSDateFormatterMediumStyle];
+    }
+
+    [self logText:@"========== 调试状态 =========="];
+    [self logText:[NSString stringWithFormat:@"端点：%@", self.activeEndpoint ?: @"(空)"]];
+    [self logText:[NSString stringWithFormat:@"首轮完成：%@　上次完成：%@",
+                   firstDone ? @"是" : @"否", lastStr]];
+    [self logText:[NSString stringWithFormat:@"中断标记：%@　正在扫描：%@",
+                   interrupted ? @"YES" : @"NO", self.scanning ? @"是" : @"否"]];
+    [self logText:[[WQLPathCache shared] debugSummary]];
+    [self logText:[WQLPathLeak checkpointSummary]];
+    [self logText:[WQLScanner pendingSummary]];
+    [self logText:[NSString stringWithFormat:@"已记录指纹：%lu 个容器",
+                   (unsigned long)[WQLScanner fingerprintCount]]];
+    [self logText:[NSString stringWithFormat:@"输出目录：%@", self.lastOutDir ?: @"无"]];
+    [self logText:@"=============================="];
+}
+
+- (void)onFlushPendingNow {
+    [self logText:@"手动补传待重传…"];
+    [self flushPendingIfPossible];
+}
+
+- (void)onResetFirstRun {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:NO forKey:@"WQLFirstRunDone"];
+    [d setDouble:0 forKey:@"WQLLastScanEnd"];
+    [d setBool:NO forKey:@"WQLScanInterrupted"];
+    [self logText:@"已重置首轮标记（路径缓存保留，下次启动会走自动全扫）"];
+    [self onShowState];
+}
+
+- (void)onClearAndFullScan {
+    if (self.scanning) {
+        [self logText:@"正在扫描，先点停止"];
+        return;
+    }
+    [[WQLPathCache shared] invalidate];
+    [WQLPathLeak clearCheckpoint];
+
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:NO forKey:@"WQLFirstRunDone"];
+    [d setDouble:0 forKey:@"WQLLastScanEnd"];
+    [d setBool:NO forKey:@"WQLScanInterrupted"];
+
+    NSString *support = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                                             NSUserDomainMask, YES) firstObject];
+    NSString *fp = [support stringByAppendingPathComponent:@"wql_fingerprints.plist"];
+    [[NSFileManager defaultManager] removeItemAtPath:fp error:nil];
+
+    [self logText:@"已清空：路径缓存 / 断点 / 指纹 / 首轮标记，开始全量扫描"];
+    [self onScan];
 }
 
 #pragma mark - UI
@@ -217,21 +297,27 @@ static NSString *WQLBuiltinEndpoint(void) {
     self.scanButton = [self buttonWithTitle:@"开始扫描" action:@selector(onScan)];
     self.stopButton = [self buttonWithTitle:@"停止" action:@selector(onStop)];
     self.stopButton.enabled = NO;
-    self.stopButton.hidden = YES;   // 调试工具：长按状态栏 5 次才出现
     UIButton *uploadButton = [self buttonWithTitle:@"上传" action:@selector(onUpload)];
     UIButton *probeButton = [self buttonWithTitle:@"测试上传" action:@selector(onUploadProbe)];
     UIButton *shareButton = [self buttonWithTitle:@"分享日志" action:@selector(onShare)];
+
+    UIButton *stateButton = [self buttonWithTitle:@"状态" action:@selector(onShowState)];
+    UIButton *flushButton = [self buttonWithTitle:@"补传" action:@selector(onFlushPendingNow)];
+    UIButton *resetButton = [self buttonWithTitle:@"重置首轮" action:@selector(onResetFirstRun)];
+    UIButton *clearButton = [self buttonWithTitle:@"清空全扫" action:@selector(onClearAndFullScan)];
 
     UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[diagButton, self.scanButton, self.stopButton]];
     UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[uploadButton, probeButton, shareButton]];
-    for (UIStackView *row in @[row1, row2]) {
+    UIStackView *row3 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[stateButton, flushButton, resetButton, clearButton]];
+    for (UIStackView *row in @[row1, row2, row3]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
     }
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2, row3]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 8;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
@@ -245,6 +331,9 @@ static NSString *WQLBuiltinEndpoint(void) {
     self.endpointField.keyboardType = UIKeyboardTypeURL;
     self.endpointField.clearButtonMode = UITextFieldViewModeWhileEditing;
     self.endpointField.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.endpointField addTarget:self
+                           action:@selector(saveEndpointOverride)
+                 forControlEvents:UIControlEventEditingDidEnd];
 
     self.logView = [UITextView new];
     self.logView.editable = NO;
@@ -275,7 +364,7 @@ static NSString *WQLBuiltinEndpoint(void) {
         [buttons.topAnchor constraintEqualToAnchor:self.endpointField.bottomAnchor constant:8],
         [buttons.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [buttons.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-        [buttons.heightAnchor constraintEqualToConstant:88],
+        [buttons.heightAnchor constraintEqualToConstant:132],
 
         [self.logView.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
@@ -296,11 +385,12 @@ static NSString *WQLBuiltinEndpoint(void) {
 
 - (void)refreshStatus {
     NSDictionary *d = [[WQLEscape shared] diagnostics];
-    self.statusLabel.text = [NSString stringWithFormat:
-                             @"iOS %@  %@   group: %@\n容器: %@\n符号: %@   flags: %@",
-                             d[@"os"], d[@"device"], d[@"group"], d[@"groupPath"],
-                             [d[@"symbolsOK"] boolValue] ? @"OK" : @"缺失",
-                             d[@"flagsFirst"]];
+    self.statusBase = [NSString stringWithFormat:
+                       @"iOS %@  %@   group: %@\n容器: %@\n符号: %@   flags: %@",
+                       d[@"os"], d[@"device"], d[@"group"], d[@"groupPath"],
+                       [d[@"symbolsOK"] boolValue] ? @"OK" : @"缺失",
+                       d[@"flagsFirst"]];
+    self.statusLabel.text = self.statusBase;
 }
 
 #pragma mark - 日志

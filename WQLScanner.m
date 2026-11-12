@@ -290,6 +290,33 @@ static uint64_t WQLFNV1a(const char *s) {
     [d writeToFile:WQLFingerprintPath() atomically:YES];
 }
 
+#pragma mark - 调试概况
+
++ (NSString *)pendingSummary {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = WQLPendingRoot();
+    NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:root error:nil];
+    if (!items.count) return @"待重传：空";
+
+    uint64_t total = 0;
+    for (NSString *n in items) {
+        NSDirectoryEnumerator *e = [fm enumeratorAtPath:[root stringByAppendingPathComponent:n]];
+        for (NSString *rel in e) {
+            NSDictionary *a = [e fileAttributes];
+            if ([a[NSFileType] isEqualToString:NSFileTypeRegular]) {
+                total += [a[NSFileSize] unsignedLongLongValue];
+            }
+        }
+    }
+    return [NSString stringWithFormat:@"待重传：%lu 个包，共 %.1f MB",
+            (unsigned long)items.count, total / 1024.0 / 1024.0];
+}
+
++ (NSUInteger)fingerprintCount {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:WQLFingerprintPath()];
+    return d.count;
+}
+
 #pragma mark - 主流程
 
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {

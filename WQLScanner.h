@@ -24,6 +24,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// 补传上次没传成功的包（Documents/wql_pending）。返回成功个数
 - (NSUInteger)flushPendingUploads;
 
+/// 调试用：待重传概况（几个包、多少 MB）
++ (NSString *)pendingSummary;
+
+/// 调试用：已记录的容器指纹数量
++ (NSUInteger)fingerprintCount;
+
 /// 上一轮是否真正进入了扫描阶段（通道不可用 / 没有 App Group 时为 NO，
 /// 调用方据此判断「首轮是否算完成」，避免一次失败就把首轮标记成跑完了）
 @property (nonatomic, readonly) BOOL lastRunUsable;

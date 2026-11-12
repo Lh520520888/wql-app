@@ -31,6 +31,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 缓存文件路径（调试用）
 @property (nonatomic, readonly) NSString *filePath;
 
+/// 调试用：缓存概况（多少根目录、多少条路径、各自上次扫描时间）
+- (NSString *)debugSummary;
+
 @end
 
 NS_ASSUME_NONNULL_END

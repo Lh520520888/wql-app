@@ -92,6 +92,24 @@
     [[NSFileManager defaultManager] removeItemAtPath:self.metaPath error:nil];
 }
 
+- (NSString *)debugSummary {
+    NSUInteger paths = 0;
+    for (NSString *k in self.map) paths += [self.map[k] count];
+
+    NSMutableString *s = [NSMutableString stringWithFormat:
+                          @"路径缓存：%lu 个根目录，%lu 条路径",
+                          (unsigned long)self.map.count, (unsigned long)paths];
+    NSArray *roots = [[self.map allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString *r in roots) {
+        NSTimeInterval since = [self secondsSinceScanForRoot:r];
+        NSString *age = (since >= DBL_MAX) ? @"从未记录"
+                      : [NSString stringWithFormat:@"%.1f 小时前", since / 3600.0];
+        [s appendFormat:@"\n    · %@：%lu 条（%@）",
+         r.lastPathComponent, (unsigned long)[self.map[r] count], age];
+    }
+    return s;
+}
+
 - (void)save {
     [self.map writeToFile:self.filePath atomically:YES];
 }

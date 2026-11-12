@@ -1,4 +1,5 @@
 #import "WQLPathLeak.h"
+#import "WQLLog.h"
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <string.h>
@@ -17,6 +18,10 @@ typedef struct {
     __unsafe_unretained NSString *key;
 } wql_prefix_t;
 
+static NSString *WQLLeakCheckpointPath(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_leak_progress.plist"];
+}
+
 @interface WQLPathLeak ()
 + (NSString *)trimmedPath:(NSString *)p;
 @end
@@ -28,7 +33,6 @@ typedef struct {
     void *h = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW | RTLD_LOCAL);
     gFSGetPath = (wql_fsgetpath_t)dlsym(h ? h : RTLD_DEFAULT, "fsgetpath");
     if (!gFSGetPath && h) {
-        // 有些版本从 kernel 句柄取不到，退回全局符号表
         gFSGetPath = (wql_fsgetpath_t)dlsym(RTLD_DEFAULT, "fsgetpath");
     }
     if (!gFSGetPath) {
@@ -64,6 +68,7 @@ typedef struct {
                                                                 completed:(BOOL *)completed
                                                                     error:(NSString **)error {
     BOOL wasCancelled = NO;
+    uint64_t startInode = 1;
     if (completed) *completed = NO;
 
     NSMutableDictionary *buckets = [NSMutableDictionary dictionary];
@@ -72,6 +77,28 @@ typedef struct {
         return buckets;
     }
     if (![self prepareWithError:error]) return buckets;
+
+    // 断点续扫：进程被杀后从上次 inode 继续
+    NSMutableDictionary *resumeBuckets = nil;
+    if (startInode <= 1) {
+        NSDictionary *cp = [NSDictionary dictionaryWithContentsOfFile:WQLLeakCheckpointPath()];
+        if ([cp isKindOfClass:[NSDictionary class]] &&
+            [cp[@"roots"] isEqual:directories] &&
+            [cp[@"maxInode"] isKindOfClass:[NSNumber class]]) {
+            double ts = [cp[@"ts"] doubleValue];
+            if ([[NSDate date] timeIntervalSince1970] - ts < 48 * 3600) {
+                startInode = [cp[@"nextInode"] unsignedLongLongValue];
+                maxInode = [cp[@"maxInode"] unsignedLongLongValue];
+                NSDictionary *pb = cp[@"buckets"];
+                if ([pb isKindOfClass:[NSDictionary class]]) {
+                    resumeBuckets = [pb mutableCopy];
+                }
+                WQLLogLine(@"pathleak: 从断点继续，inode %llu / %llu",
+                           (unsigned long long)startInode,
+                           (unsigned long long)maxInode);
+            }
+        }
+    }
 
     if (maxInode == 0) {
         maxInode = [self baselineInodeWithError:error];
@@ -82,13 +109,20 @@ typedef struct {
     for (NSString *dir in directories) {
         NSString *trimmed = [self trimmedPath:dir];
         struct statfs sfs;
-        if (statfs(trimmed.fileSystemRepresentation, &sfs) != 0) {
-            continue;
-        }
+        if (statfs(trimmed.fileSystemRepresentation, &sfs) != 0) continue;
         NSString *vol = [NSString stringWithFormat:@"%d:%d", sfs.f_fsid.val[0], sfs.f_fsid.val[1]];
         if (!byVolume[vol]) byVolume[vol] = [NSMutableArray array];
         [byVolume[vol] addObject:trimmed];
         buckets[trimmed] = [NSMutableArray array];
+    }
+
+    // 断点里已扫到的路径先并进来
+    for (NSString *k in resumeBuckets) {
+        NSMutableArray *arr = buckets[k];
+        if (![arr isKindOfClass:[NSMutableArray class]]) continue;
+        for (NSString *p in resumeBuckets[k]) {
+            if ([p isKindOfClass:[NSString class]] && ![arr containsObject:p]) [arr addObject:p];
+        }
     }
 
     uint64_t totalDone = 0;
@@ -111,11 +145,24 @@ typedef struct {
         }
 
         char buf[PATH_MAX];
-        for (uint64_t ino = 1; ino <= maxInode; ino++) {
+        uint64_t from = (startInode > 0) ? startInode : 1;
+        for (uint64_t ino = from; ino <= maxInode; ino++) {
             if ((ino & 0x3FFF) == 0) {
                 if (cancel && cancel()) { wasCancelled = YES; break; }
                 if (progress) progress(totalDone + ino, maxInode * byVolume.count);
                 @autoreleasepool { }
+            }
+
+            // 每 200 万 inode 落一次断点，被杀也只损失这一小段
+            if ((ino % 2000000ULL) == 0) {
+                NSDictionary *cp = @{
+                    @"roots": directories,
+                    @"maxInode": @(maxInode),
+                    @"nextInode": @(ino + 1),
+                    @"ts": @([[NSDate date] timeIntervalSince1970]),
+                    @"buckets": buckets,
+                };
+                [cp writeToFile:WQLLeakCheckpointPath() atomically:YES];
             }
 
             long n = gFSGetPath(buf, sizeof(buf), &fsid, ino);
@@ -143,6 +190,9 @@ typedef struct {
 
     if (progress) progress(totalDone, totalDone);
     if (completed) *completed = !wasCancelled;
+    if (!wasCancelled) {
+        [[NSFileManager defaultManager] removeItemAtPath:WQLLeakCheckpointPath() error:nil];
+    }
 
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (NSString *k in buckets) out[k] = [buckets[k] copy];

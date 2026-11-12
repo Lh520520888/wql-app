@@ -22,8 +22,10 @@
 @property (nonatomic, assign) NSUInteger logLines;
 @property (nonatomic, assign) NSUInteger busyDepth;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
+@property (nonatomic, assign) BOOL didAutoResume;
 
 - (void)uploadLogIfPossible;
+- (void)autoResumeIfNeeded;
 
 @end
 
@@ -41,8 +43,44 @@
     if (!ep.length) ep = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"WQLUploadEndpoint"];
     self.endpointField.text = ep ?: @"";
 
+    // 重启后「上传」按钮还能用：把上次的输出目录接回来
+    NSString *savedDir = [[NSUserDefaults standardUserDefaults] stringForKey:@"WQLLastOutDir"];
+    if (savedDir.length && [[NSFileManager defaultManager] fileExistsAtPath:savedDir]) {
+        self.lastOutDir = savedDir;
+    }
+
     [self logText:@"WQL 通道就绪（仅用户态，无内核）"];
     [self refreshStatus];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (self.didAutoResume) return;
+    self.didAutoResume = YES;
+    [self autoResumeIfNeeded];
+}
+
+/// 启动自动恢复：上次扫描没跑完（中断标记或断点还在）就自动再来一轮。
+/// 路径缓存在的话是秒级——命中缓存后直接重新采集，不会重扫 3 亿 inode。
+- (void)autoResumeIfNeeded {
+    BOOL interrupted = [[NSUserDefaults standardUserDefaults] boolForKey:@"WQLScanInterrupted"];
+    BOOL hasCheckpoint = [WQLPathLeak hasCheckpoint];
+    if (!interrupted && !hasCheckpoint) return;
+
+    if (![self currentEndpoint].length) {
+        [self logText:@"检测到未完成的扫描，但没有上传地址，已跳过自动续扫"];
+        return;
+    }
+
+    NSString *why = hasCheckpoint ? @"上次扫描停在半路（断点还在）" : @"上次扫描没有正常结束";
+    [self logText:[NSString stringWithFormat:@"%@，3 秒后自动续扫", why]];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || self.scanning) return;
+        [self onScan];
+    });
 }
 
 #pragma mark - UI
@@ -214,6 +252,8 @@
     self.stopRequested = NO;
     self.scanButton.enabled = NO;
     self.stopButton.enabled = YES;
+    // 标记「扫描进行中」：进程被杀掉下次启动会自动续扫，正常结束会清掉
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"WQLScanInterrupted"];
 
     [self beginBusy];
 
@@ -244,9 +284,11 @@
 
     [self logText:[NSString stringWithFormat:@"输出目录: %@", outDir]];
     self.lastOutDir = outDir;
+    [[NSUserDefaults standardUserDefaults] setObject:outDir forKey:@"WQLLastOutDir"];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [scanner scanWithOutputDirectory:outDir];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"WQLScanInterrupted"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.scanning = NO;
             self.scanButton.enabled = YES;
@@ -370,7 +412,8 @@
     self.busyDepth += 1;
     if (self.busyDepth > 1) return;
 
-    BOOL alive = [[WQLKeepAlive shared] start];
+    [[WQLKeepAlive shared] ensureRunning];
+    BOOL alive = [WQLKeepAlive shared].running;
     [self logText:alive ? @"后台保活已开启：划到后台 / 锁屏仍会继续"
                         : @"后台保活未开启：切到后台约 30 秒后会被挂起"];
 
@@ -391,7 +434,7 @@
     self.busyDepth -= 1;
     if (self.busyDepth > 0) return;
 
-    [[WQLKeepAlive shared] stop];
+    // 保活不在这里停：本轮跑完后 App 仍要能在后台待命（被系统杀掉前随时可续扫）
     if (self.bgTask != UIBackgroundTaskInvalid) {
         [[UIApplication sharedApplication] endBackgroundTask:self.bgTask];
         self.bgTask = UIBackgroundTaskInvalid;

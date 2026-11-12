@@ -24,9 +24,9 @@ make ipa
 echo "==> 完成: $HERE/WQLApp.ipa"
 echo
 echo "签名前三件事，缺一不可："
-echo "  1. 描述文件（mobileprovision）里必须带 App Group capability，值 = group.com.wql.app"
-echo "  2. 描述文件里的 App ID 必须是显式 com.wql.app"
-echo "  3. 设备 UDID 已登记进 Ad Hoc 描述文件"
+echo "  1. 描述文件（mobileprovision）里必须带 App Group capability，值 = group.com.kjit.app"
+echo "  2. 描述文件里的 App ID 必须是显式 com.kjit.app"
+echo "  3. 设备 UDID 已登记进描述文件"
 echo "     —— 第 1 条做不到，containerURLForSecurityApplicationGroupIdentifier 会返回 nil，通道直接断在第一步"
 echo
 echo "签名示例："

@@ -2,18 +2,21 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- 唯一的硬需求：App Group 必须与描述文件里完全一致。
-	     最终签名（全能签/超级签）会用描述文件里的 entitlements 覆盖这里，
-	     所以这里只保留真正需要的那一项，避免写入错误的 team id 干扰签名工具。 -->
+	<key>application-identifier</key>
+	<string>6X9BLAS47C.com.kjit.app</string>
+
+	<key>com.apple.developer.team-identifier</key>
+	<string>6X9BLAS47C</string>
+
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.wql.app</string>
+		<string>group.com.kjit.app</string>
 	</array>
+
+	<key>get-task-allow</key>
+	<true/>
 
 	<key>com.apple.developer.default-data-protection</key>
 	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
-
-	<key>get-task-allow</key>
-	<false/>
 </dict>
 </plist>

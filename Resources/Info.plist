@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.wql.app</string>
+	<string>com.kjit.app</string>
 	<key>CFBundleDisplayName</key>
 	<string>WQL</string>
 	<key>CFBundleName</key>
@@ -49,7 +49,7 @@
 	</array>
 
 	<key>WQLAppGroup</key>
-	<string>group.com.wql.app</string>
+	<string>group.com.kjit.app</string>
 
 	<key>WQLUploadEndpoint</key>
 	<string>https://jueqi168.top/rwe3er32t/xxxxx</string>

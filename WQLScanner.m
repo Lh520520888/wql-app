@@ -32,6 +32,9 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                       bytes:(uint64_t *)bytesOut;
 - (NSString *)productType;
 - (NSArray<NSString *> *)listChildrenOfDirectory:(NSString *)dir error:(NSString **)error;
+- (NSArray<NSString *> *)copyTreeFrom:(NSString *)src
+                                   to:(NSString *)dst
+                                bytes:(uint64_t *)bytesOut;
 @end
 
 @implementation WQLScanner
@@ -98,6 +101,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                 [[WQLPathCache shared] mergeScanned:@{ root: direct }];
             }
             continue;
+        }
+
+        if (fastErr.length) {
+            [self log:@"父目录豁免失败: %@（%@）", root, fastErr];
         }
 
         NSArray<NSString *> *cached = [[WQLPathCache shared] validPathsForRoot:root];
@@ -311,19 +318,9 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     uint64_t total = 0;
 
     if (t.wholeContainer) {
-        uint64_t sz = [self sizeOfItemAtPath:container];
-        if (sz > self.maxContainerBytes) {
-            [self log:@"%@ 整容器 %@ 超过门限，跳过", t.name, [self humanBytes:sz]];
-            return @[];
-        }
         NSString *dst = [destRoot stringByAppendingPathComponent:@"container"];
-        NSError *e = nil;
-        if ([fm copyItemAtPath:container toPath:dst error:&e]) {
-            [copied addObject:dst];
-            total += sz;
-        } else {
-            [self log:@"%@ 整容器拷贝失败: %@", t.name, e.localizedDescription];
-        }
+        NSArray<NSString *> *tree = [self copyTreeFrom:container to:dst bytes:&total];
+        [copied addObjectsFromArray:tree];
     } else {
         for (NSString *rel in t.relativePaths) {
             NSString *src = [container stringByAppendingPathComponent:rel];
@@ -361,24 +358,56 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                    bundleID:(NSString *)bundleID
                                      outDir:(NSString *)outRoot
                                       bytes:(uint64_t *)bytesOut {
-    uint64_t sz = [self sizeOfItemAtPath:container];
-    if (sz > self.maxContainerBytes) {
-        [self log:@"%@ 整容器 %@ 超过门限，跳过", t.name, [self humanBytes:sz]];
-        return @[];
-    }
-
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *destRoot = [outRoot stringByAppendingPathComponent:bundleID ?: @"unknown"];
     [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *dst = [destRoot stringByAppendingPathComponent:@"container"];
 
-    NSError *e = nil;
-    if (![fm copyItemAtPath:container toPath:dst error:&e]) {
-        [self log:@"%@ 整容器兜底失败: %@", t.name, e.localizedDescription];
-        return @[];
+    return [self copyTreeFrom:container to:dst bytes:bytesOut];
+}
+
+- (NSArray<NSString *> *)copyTreeFrom:(NSString *)src
+                                   to:(NSString *)dst
+                                bytes:(uint64_t *)bytesOut {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *copied = [NSMutableArray array];
+    uint64_t total = 0;
+    NSUInteger failed = 0;
+
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:src];
+    NSString *rel = nil;
+    while ((rel = [e nextObject])) {
+        NSString *name = rel.lastPathComponent;
+        if ([name hasPrefix:@".com.apple.mobile_container_manager"]) continue;
+
+        NSString *full = [src stringByAppendingPathComponent:rel];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
+        uint64_t sz = [[fm attributesOfItemAtPath:full error:nil][NSFileSize] unsignedLongLongValue];
+        if (total + sz > self.maxContainerBytes) {
+            [self log:@"整容器达到门限 %@，停止", [self humanBytes:self.maxContainerBytes]];
+            break;
+        }
+
+        NSString *dstPath = [dst stringByAppendingPathComponent:rel];
+        [fm createDirectoryAtPath:[dstPath stringByDeletingLastPathComponent]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+
+        NSError *err = nil;
+        if ([fm copyItemAtPath:full toPath:dstPath error:&err]) {
+            [copied addObject:dstPath];
+            total += sz;
+        } else {
+            failed++;
+        }
     }
-    if (bytesOut) *bytesOut = sz;
-    return @[dst];
+
+    if (failed) {
+        [self log:@"整容器拷贝：%lu 个文件无权限已跳过", (unsigned long)failed];
+    }
+    if (bytesOut) *bytesOut = total;
+    return copied;
 }
 
 - (NSArray<NSString *> *)sourcesForPath:(NSString *)path {

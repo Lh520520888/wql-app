@@ -255,6 +255,60 @@
     return NO;
 }
 
+#pragma mark - 日志上传
+
+- (void)uploadLogFile:(NSString *)path completion:(void (^)(BOOL))completion {
+    NSString *ep = self.endpoint;
+    if (!ep.length) {
+        [self log:@"日志上传: 未配置 endpoint，跳过"];
+        if (completion) completion(NO);
+        return;
+    }
+
+    NSData *data = [NSData dataWithContentsOfFile:path
+                                          options:NSDataReadingMappedIfSafe
+                                            error:nil];
+    if (!data.length) {
+        [self log:@"日志上传: 文件为空或读不到 %@", path];
+        if (completion) completion(NO);
+        return;
+    }
+
+    // 只取尾部 8MB（日志本身 2MB 轮转，正常不会触发）
+    const NSUInteger kMax = 8 * 1024 * 1024;
+    if (data.length > kMax) {
+        data = [data subdataWithRange:NSMakeRange(data.length - kMax, kMax)];
+    }
+
+    UIDevice *dev = [UIDevice currentDevice];
+    NSString *idfv = dev.identifierForVendor.UUIDString ?: @"nodev";
+    if (idfv.length > 8) idfv = [idfv substringToIndex:8];
+    NSDateFormatter *df = [NSDateFormatter new];
+    df.dateFormat = @"yyyyMMdd_HHmmss";
+    NSString *name = [NSString stringWithFormat:@"wql_log_%@_%@.txt",
+                      idfv, [df stringFromDate:[NSDate date]]];
+
+    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+    if (![data writeToFile:tmp atomically:YES]) {
+        [self log:@"日志上传: 写临时文件失败"];
+        if (completion) completion(NO);
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        BOOL ok = [self uploadFile:tmp relative:name filename:name];
+        [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+        [self log:@"日志上传: %@（%lu B，文件名 %@）",
+              ok ? @"成功" : @"失败", (unsigned long)data.length, name];
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(ok); });
+        }
+    });
+}
+
 #pragma mark - multipart
 
 - (NSData *)headerDataForFilename:(NSString *)filename

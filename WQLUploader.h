@@ -24,6 +24,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)uploadDirectory:(NSString *)dir
              completion:(void (^_Nullable)(NSUInteger ok, NSUInteger failed))completion;
 
+/// 单独上传一份日志文件：走完整 multipart，文件名固定为 wql_log_<idfv8>_<yyyyMMdd_HHmmss>.txt，
+/// 服务端按普通附件落盘，不用从 zip 里解。超过 8MB 只取尾部。
+/// completion 回到主线程。
+- (void)uploadLogFile:(NSString *)path completion:(void (^_Nullable)(BOOL ok))completion;
+
 /// 中止当前上传
 - (void)cancel;
 

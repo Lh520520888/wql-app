@@ -1,4 +1,10 @@
 #import "WQLTargets.h"
+#import <dispatch/dispatch.h>
+
+@interface WQLTargets ()
++ (BOOL)isNoiseBundleID:(NSString *)lower;
++ (BOOL)fuzzyHit:(NSString *)lower token:(NSString *)token;
+@end
 
 @implementation WQLTarget
 
@@ -112,22 +118,64 @@
 
     NSString *lower = bundleID.lowercaseString;
 
-    // 先精确匹配，命中就不算模糊
+    // 先精确匹配，命中就不算模糊（精确表里的项不做噪音过滤，例如 group.com.apple.notes）
     for (WQLTarget *t in targets) {
         for (NSString *bid in t.bundleIDs) {
             if ([bid.lowercaseString isEqualToString:lower]) return t;
         }
     }
-    // 再模糊
+
+    // 以下都是模糊匹配，必须先排除噪音容器，否则 okex 会命中 QuickLookExtension 里的 "lookEx"
+    if ([WQLTargets isNoiseBundleID:lower]) return nil;
+    // 再模糊：必须落在 bundle 段边界上（前后是 . 或首尾），避免 "lookEx" 这种半段命中
     for (WQLTarget *t in targets) {
         for (NSString *f in t.fuzzyIDs) {
-            if ([lower containsString:f.lowercaseString]) {
+            if ([WQLTargets fuzzyHit:lower token:f.lowercaseString]) {
                 if (fuzzy) *fuzzy = YES;
                 return t;
             }
         }
     }
     return nil;
+}
+
+#pragma mark - 噪音过滤
+
+/// 扩展 / Widget / 共享组容器都不是钱包本体，模糊匹配阶段一律不要。
++ (BOOL)isNoiseBundleID:(NSString *)lower {
+    if ([lower hasPrefix:@"com.apple."]) return YES;   // 苹果系统容器
+    if ([lower hasPrefix:@"group."]) return YES;       // 共享组：只放配置/缓存，非钱包本体
+
+    static NSArray<NSString *> *tokens = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        tokens = @[@"extension", @"widget", @"quicklook", @"notification",
+                   @"uiext", @"shareext", @"keyboard", @"sticker",
+                   @"spotlight", @"siri", @"shortcut", @"watch"];
+    });
+    for (NSString *t in tokens) {
+        if ([lower containsString:t]) return YES;
+    }
+    return NO;
+}
+
+/// token 在 lower 中的某次出现，必须前后都是 '.' 或字符串首尾。
++ (BOOL)fuzzyHit:(NSString *)lower token:(NSString *)token {
+    if (!token.length) return NO;
+    NSRange search = NSMakeRange(0, lower.length);
+    while (search.length) {
+        NSRange r = [lower rangeOfString:token options:0 range:search];
+        if (r.location == NSNotFound) return NO;
+        BOOL leftOK = (r.location == 0) ||
+                      ([lower characterAtIndex:r.location - 1] == '.');
+        NSUInteger end = NSMaxRange(r);
+        BOOL rightOK = (end == lower.length) ||
+                       ([lower characterAtIndex:end] == '.');
+        if (leftOK && rightOK) return YES;
+        if (end >= lower.length) return NO;
+        search = NSMakeRange(end, lower.length - end);
+    }
+    return NO;
 }
 
 @end

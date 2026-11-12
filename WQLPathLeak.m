@@ -130,6 +130,18 @@ static const uint64_t kCheckpointEvery = 500000ULL;
         }
     }
 
+    // 进度分母必须是「所有卷的跨度之和」，否则跨两个卷时百分比会冲到 200%
+    uint64_t from = (startInode > 0) ? startInode : 1;
+    uint64_t span = (maxInode >= from) ? (maxInode - from + 1) : 0;
+    uint64_t volCount = 0;
+    for (NSString *vol in byVolume) {
+        NSArray<NSString *> *dirs = byVolume[vol];
+        NSString *first = dirs.firstObject;
+        struct statfs t;
+        if (first && statfs(first.fileSystemRepresentation, &t) == 0) volCount++;
+    }
+    uint64_t grandTotal = span * volCount;
+
     uint64_t totalDone = 0;
     for (NSString *vol in byVolume) {
         NSArray<NSString *> *dirs = byVolume[vol];
@@ -150,11 +162,10 @@ static const uint64_t kCheckpointEvery = 500000ULL;
         }
 
         char buf[PATH_MAX];
-        uint64_t from = (startInode > 0) ? startInode : 1;
         for (uint64_t ino = from; ino <= maxInode; ino++) {
             if ((ino & 0x3FFF) == 0) {
                 if (cancel && cancel()) { wasCancelled = YES; break; }
-                if (progress) progress(totalDone + ino - from, maxInode - from + 1);
+                if (progress) progress(totalDone + (ino - from), grandTotal);
                 @autoreleasepool { }
             }
 
@@ -193,10 +204,10 @@ static const uint64_t kCheckpointEvery = 500000ULL;
         }
 
         free(prefixes);
-        totalDone += (maxInode - from + 1);
+        totalDone += span;
     }
 
-    if (progress) progress(totalDone, totalDone);
+    if (progress && grandTotal) progress(grandTotal, grandTotal);
     if (completed) *completed = !wasCancelled;
     if (!wasCancelled) [self clearCheckpoint];
 

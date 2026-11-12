@@ -21,11 +21,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// 返回 YES 则中止
 @property (nonatomic, copy, nullable) BOOL (^cancelBlock)(void);
 
-/// 默认根目录：App Data / App Group / 两个 iOS 27 系统目录
+/// 每采到一个钱包立刻回调：参数是待打包目录（含 _manifest.json）。
+/// 由调用方负责打包上传，回调返回后该目录会被删除。
+@property (nonatomic, copy, nullable) void (^uploadBlock)(NSString *stagingDir, NSString *walletName);
+
+/// 默认根目录
 - (NSArray<NSString *> *)defaultRoots;
 
-/// 主流程。返回每个容器的记录字典：
-///   bundleId / path / target / status / files / bytes
+/// 主流程。返回每个容器的记录字典：bundleId / path / target / status / files / bytes
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir;
 
 @end

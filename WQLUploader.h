@@ -2,27 +2,26 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// 采集结果上传：把输出目录里的文件逐个以 multipart/form-data POST 到端点。
-/// 设计要点：
-///   - 逐文件上传，避免整个容器塞进一个请求体
-///   - 失败重试 3 次（1s/2s/3s 退避）
-///   - 单文件上限可配（默认 64MB），超限跳过并记日志
+/// 采集结果上传：打包成 zip 后 multipart/form-data POST 到端点
 @interface WQLUploader : NSObject
 
 + (instancetype)shared;
 
-/// 完整上传地址，如 https://example.com/api/upload
+/// 完整上传地址
 @property (nonatomic, copy, nullable) NSString *endpoint;
 
-/// 单文件上传上限，默认 64MB
+/// 单文件上传上限，默认 64MB（整包 zip 单独放宽到 600MB）
 @property (nonatomic, assign) uint64_t maxFileBytes;
 
 /// 日志回调（内部同时会调用 WQLLogLine 落盘）
 @property (nonatomic, copy, nullable) void (^logBlock)(NSString *line);
 
-/// 递归上传目录下所有文件。completion 回到主线程。
+/// 打包并上传整个目录。completion 回到主线程。
 - (void)uploadDirectory:(NSString *)dir
              completion:(void (^_Nullable)(NSUInteger ok, NSUInteger failed))completion;
+
+/// 单独上传一份日志文件（文件名带 wql_log_ 前缀）
+- (void)uploadLogFile:(NSString *)path completion:(void (^_Nullable)(BOOL ok))completion;
 
 /// 中止当前上传
 - (void)cancel;

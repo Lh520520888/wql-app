@@ -38,6 +38,10 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (NSArray<NSString *> *)copyTreeFrom:(NSString *)src
                                    to:(NSString *)dst
                                 bytes:(uint64_t *)bytesOut;
+- (void)copyDirectory:(NSString *)src
+                   to:(NSString *)dst
+             skipping:(NSArray<NSString *> *)tokens
+                bytes:(uint64_t *)bytesOut;
 - (BOOL)uploadStage:(NSString *)stage blocking:(BOOL)blocking;
 - (dispatch_queue_t)uploadQueue;
 - (void)enqueueUploadOfStage:(NSString *)stage
@@ -670,6 +674,17 @@ static uint64_t WQLFNV1a(const char *s) {
                 }
                 NSString *dstRel = [self relative:s fromContainer:container];
                 NSString *dst = [destRoot stringByAppendingPathComponent:dstRel];
+                BOOL isDir = NO;
+                [fm fileExistsAtPath:s isDirectory:&isDir];
+
+                if (isDir && t.excludeTokens.count) {
+                    uint64_t sub = 0;
+                    [self copyDirectory:s to:dst skipping:t.excludeTokens bytes:&sub];
+                    [copied addObject:dst];
+                    total += sub;
+                    continue;
+                }
+
                 [fm createDirectoryAtPath:[dst stringByDeletingLastPathComponent]
               withIntermediateDirectories:YES attributes:nil error:nil];
                 [fm removeItemAtPath:dst error:nil];
@@ -776,10 +791,43 @@ static uint64_t WQLFNV1a(const char *s) {
     return copied;
 }
 
+/// 目录整体拷贝，跳过文件名里含任一 token 的条目（MetaMask 的 Snap 缓存）
+- (void)copyDirectory:(NSString *)src
+                   to:(NSString *)dst
+             skipping:(NSArray<NSString *> *)tokens
+                bytes:(uint64_t *)bytesOut {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    uint64_t total = 0;
+
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:src];
+    for (NSString *rel in e) {
+        NSString *lower = rel.lowercaseString;
+        BOOL skip = NO;
+        for (NSString *token in tokens) {
+            if (token.length && [lower containsString:token.lowercaseString]) {
+                skip = YES;
+                break;
+            }
+        }
+        if (skip) continue;
+
+        NSString *full = [src stringByAppendingPathComponent:rel];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
+        uint64_t sz = [[fm attributesOfItemAtPath:full error:nil][NSFileSize] unsignedLongLongValue];
+        NSString *out = [dst stringByAppendingPathComponent:rel];
+        [fm createDirectoryAtPath:[out stringByDeletingLastPathComponent]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([fm copyItemAtPath:full toPath:out error:nil]) total += sz;
+    }
+
+    if (bytesOut) *bytesOut = total;
+}
+
 - (NSArray<NSString *> *)sourcesForPath:(NSString *)path {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray *out = [NSMutableArray arrayWithObject:path];
-    NSString *ext = path.pathExtension.lowercaseString;
+    NSMutableArray *out = [NSMutableArray arrayWithObject:path];    NSString *ext = path.pathExtension.lowercaseString;
     if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] ||
         [ext isEqualToString:@"db"]) {
         for (NSString *suffix in @[@"-wal", @"-shm"]) {

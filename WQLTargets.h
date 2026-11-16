@@ -11,6 +11,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSArray<NSString *> *relativePaths; // 容器内相对路径（文件或目录）
 @property (nonatomic, assign) BOOL wholeContainer;             // 整个容器打包（Bitpie）
 @property (nonatomic, assign) uint64_t maxBytes;               // 本目标的体积上限，0 = 用全局门限
+@property (nonatomic, copy, nullable) NSArray<NSString *> *excludeTokens; // 目录内文件名含这些词的跳过
 
 - (BOOL)matchesBundleID:(NSString *)bundleID;
 

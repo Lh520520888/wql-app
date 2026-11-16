@@ -12,6 +12,7 @@
 #import <sys/sysctl.h>
 #import <stdarg.h>
 #import <sys/xattr.h>
+#import <sys/mount.h>
 
 static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manager.metadata.plist";
 

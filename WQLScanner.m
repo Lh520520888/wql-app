@@ -542,6 +542,7 @@ static uint64_t WQLFNV1a(const char *s) {
           (unsigned long)daemons.count, -[t0 timeIntervalSinceNow]];
 
     NSUInteger opened = 0, stores = 0;
+    BOOL dumped = NO;
     for (NSString *container in daemons) {
         int64_t handle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
         if (handle <= 0) continue;
@@ -582,6 +583,22 @@ static uint64_t WQLFNV1a(const char *s) {
             for (NSString *bid in map) {
                 if (shown++ >= 3) break;
                 [self log:@"        · %@ → %@", bid, map[bid]];
+            }
+
+            // 解析不出来就把原始文件传一份回去离线分析（只传一次，取最大那个）
+            if (map.count < 50 && !dumped && data.length > 4 * 1024 * 1024) {
+                dumped = YES;
+                NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
+                NSFileManager *fm = [NSFileManager defaultManager];
+                [fm removeItemAtPath:stage error:nil];
+                [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *dst = [stage stringByAppendingPathComponent:name];
+                if ([fm copyItemAtPath:path toPath:dst error:nil]) {
+                    [self log:@"    ↑ 上传原始 csstore 供离线分析（%.1f MB）", data.length / 1048576.0];
+                    BOOL ok = [self uploadStage:stage blocking:YES];
+                    [self log:@"    %@ csstore 上传", ok ? @"✅" : @"⛔"];
+                }
+                [fm removeItemAtPath:stage error:nil];
             }
         }
         [[WQLEscape shared] releaseHandle:handle];

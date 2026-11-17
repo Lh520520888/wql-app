@@ -60,6 +60,67 @@ static NSDictionary<NSString *, NSString *> *WQLParseCSStore(NSData *data,
     return map.count ? map : nil;
 }
 
+static BOOL WQLLooksLikeBundleID(NSString *s) {
+    if (s.length < 3 || s.length > 200) return NO;
+    if (![s containsString:@"."]) return NO;
+    NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:
+                            @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"]
+                           invertedSet];
+    return [s rangeOfCharacterFromSet:bad].location == NSNotFound;
+}
+
+static BOOL WQLLooksLikeContainerPath(NSString *s) {
+    if (![s hasPrefix:@"/"]) return NO;
+    return [s containsString:@"/Containers/Data/"] || [s containsString:@"/Containers/Shared/"];
+}
+
+/// 自动探测记录长度：记录前面是 [u32 id][u32 size]，size 会重复出现几千次
+static uint32_t WQLDetectRecordSize(const uint8_t *base, size_t size) {
+    static uint32_t counts[0x801];
+    memset(counts, 0, sizeof(counts));
+
+    size_t limit = MIN(size, (size_t)4 * 1024 * 1024);
+    for (size_t off = 0; off + 8 <= limit; off += 4) {
+        uint32_t v = WQLRd32(base + off + 4);
+        if (v >= 0x100 && v <= 0x800) counts[v]++;
+    }
+
+    uint32_t best = 0, bestN = 0;
+    for (uint32_t v = 0x100; v <= 0x800; v += 4) {
+        if (counts[v] > bestN) { bestN = counts[v]; best = v; }
+    }
+    return bestN >= 50 ? best : 0;
+}
+
+/// 不依赖字段偏移：在每条记录里扫一遍，找“像 bundleId”和“像容器路径”的字符串引用
+static NSDictionary<NSString *, NSString *> *WQLParseCSStoreAuto(NSData *data,
+                                                                 uint32_t recordSize) {
+    const uint8_t *base = data.bytes;
+    size_t size = data.length;
+    if (size < 0x1000 || recordSize == 0) return nil;
+
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+    for (size_t off = 0; off + 8 + recordSize <= size; off += 4) {
+        if (WQLRd32(base + off + 4) != recordSize) continue;
+
+        const uint8_t *body = base + off + 8;
+        NSString *bid = nil, *con = nil;
+        for (uint32_t f = 0; f + 4 <= recordSize; f += 4) {
+            uint32_t ref = WQLRd32(body + f);
+            if (!ref || (ref & 3) || ref >= size) continue;
+
+            NSString *s = WQLCSString(base, size, ref);
+            if (!s.length) continue;
+
+            if (!bid && WQLLooksLikeBundleID(s)) bid = s;
+            else if (!con && WQLLooksLikeContainerPath(s)) con = s;
+            if (bid && con) break;
+        }
+        if (bid.length && con.length) map[bid] = con;
+    }
+    return map.count ? map : nil;
+}
+
 @interface WQLScanner ()
 - (void)log:(NSString *)fmt, ...;
 - (NSString *)bundleIDForContainerPath:(NSString *)path;
@@ -500,31 +561,27 @@ static uint64_t WQLFNV1a(const char *s) {
             if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
 
             stores++;
-            struct { uint32_t size, bid, con; const char *label; } layouts[] = {
-                {0x23c, 0x0c, 0x64, "26"},
-                {0x23c, 0x0c, 0x60, "26.5"},
-                {0x250, 0x0c, 0x68, "27.0"},
-                {0x25c, 0x0c, 0x6c, "27.2"},
-            };
-            NSDictionary *best = nil;
-            const char *bestLabel = "?";
+            uint32_t detected = WQLDetectRecordSize(data.bytes, data.length);
+            NSDictionary *map = WQLParseCSStoreAuto(data, detected);
 
+            // 自动探测失败时，用参考项目的四种固定布局再兜一次
+            struct { uint32_t size, bid, con; } layouts[] = {
+                {0x23c, 0x0c, 0x64}, {0x23c, 0x0c, 0x60},
+                {0x250, 0x0c, 0x68}, {0x25c, 0x0c, 0x6c},
+            };
             for (int i = 0; i < 4; i++) {
-                NSDictionary *map = WQLParseCSStore(data, layouts[i].size,
-                                                    layouts[i].bid, layouts[i].con);
-                if (map.count > best.count) {
-                    best = map;
-                    bestLabel = layouts[i].label;
-                }
+                NSDictionary *m = WQLParseCSStore(data, layouts[i].size,
+                                                  layouts[i].bid, layouts[i].con);
+                if (m.count > map.count) map = m;
             }
 
-            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s，%lu 条容器",
-                  name, data.length / 1048576.0, bestLabel, (unsigned long)best.count];
+            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 记录长度 0x%x，%lu 条容器",
+                  name, data.length / 1048576.0, detected, (unsigned long)map.count];
 
             NSInteger shown = 0;
-            for (NSString *bid in best) {
+            for (NSString *bid in map) {
                 if (shown++ >= 3) break;
-                [self log:@"        · %@ → %@", bid, best[bid]];
+                [self log:@"        · %@ → %@", bid, map[bid]];
             }
         }
         [[WQLEscape shared] releaseHandle:handle];

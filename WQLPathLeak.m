@@ -221,7 +221,13 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
         __block BOOL stopAll = NO;
         __block NSTimeInterval lastSave = [NSDate date].timeIntervalSince1970;
 
-        dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
+        // 实测 26.4.2 上 4 线程更慢（fsgetpath 被内核串行化），默认回到单线程；
+        // 需要对比时可用 WQLScanWorkers 覆盖。
+        NSInteger workers = [[NSUserDefaults standardUserDefaults] integerForKey:@"WQLScanWorkers"];
+        if (workers < 1 || workers > 8) workers = 1;
+        WQLLogLine(@"扫描线程：%ld", (long)workers);
+
+        dispatch_apply((size_t)workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
             char b[PATH_MAX];
             fsid_t volume = fsid;   // block 里 fsid 是 const 副本，取地址要非 const
 

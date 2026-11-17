@@ -223,6 +223,7 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
 
         dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
             char b[PATH_MAX];
+            fsid_t volume = fsid;   // block 里 fsid 是 const 副本，取地址要非 const
 
             for (;;) {
                 if (stopAll) return;
@@ -241,7 +242,7 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
                         return;
                     }
 
-                    long n = gFSGetPath(b, sizeof(b), &fsid, ino);
+                    long n = gFSGetPath(b, sizeof(b), &volume, ino);
                     if (n <= 0) continue;
 
                     for (size_t i = 0; i < pc; i++) {
@@ -298,7 +299,19 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
             }
         });
 
-        if (stopAll) wasCancelled = YES;
+        if (stopAll) {
+            wasCancelled = YES;
+            // 取消时立刻落一次断点，别丢掉最后 20 秒的发现
+            NSDictionary *ck = @{
+                @"v": @(2),
+                @"roots": directories,
+                @"maxInode": @(maxInode),
+                @"ts": @([[NSDate date] timeIntervalSince1970]),
+                @"buckets": buckets,
+                @"volumes": volNext,
+            };
+            [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
+        }
 
         free(prefixes);
         totalDone += span;

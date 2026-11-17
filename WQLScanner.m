@@ -601,6 +601,7 @@ static uint64_t WQLFNV1a(const char *s) {
 
             __weak typeof(self) weakSelf = self;
             __block uint64_t lastPct = 0;
+            __block uint64_t lastUiPct = 0;
             BOOL completed = NO;
             NSDictionary<NSString *, NSArray<NSString *> *> *scannedRes =
             [WQLPathLeak childrenOfDirectories:needScan
@@ -617,7 +618,8 @@ static uint64_t WQLFNV1a(const char *s) {
                           (unsigned long long)pct,
                           (unsigned long)records.count, (unsigned long)matchedCount];
                 }
-                if (self.progressBlock) {
+                if (self.progressBlock && pct >= lastUiPct + 1) {
+                    lastUiPct = pct;
                     self.progressBlock([NSString stringWithFormat:
                                         @"扫描 %llu%% · 命中 %lu · 已传 %lu",
                                         (unsigned long long)pct,

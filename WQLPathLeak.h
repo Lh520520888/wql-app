@@ -24,6 +24,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 调试用：断点概况（按卷的进度、保存时间）
 + (NSString *)checkpointSummary;
 
+/// 只读、无断点：在 dir 下、限定 inode 上限内找直接子项。
+/// 用于快速定位 lsd 的 CSStore（daemon 容器 inode 通常很小）。
++ (NSArray<NSString *> *)childrenOfDirectory:(NSString *)dir upToInode:(uint64_t)limit;
+
 /// 一次遍历，返回 dir -> 直接子项数组（同时通过 onPath 逐个回调）。
 /// @param maxInode  0 = 自动取基线，并从断点续扫
 /// @param onPath    每发现一个直接子项回调一次（在扫描线程上同步执行）

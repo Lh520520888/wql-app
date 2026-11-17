@@ -326,8 +326,35 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
     return out;
 }
 
-+ (NSString *)trimmedPath:(NSString *)p {
-    NSString *s = p;
++ (NSArray<NSString *> *)childrenOfDirectory:(NSString *)dir upToInode:(uint64_t)limit {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    if (![self prepareWithError:NULL]) return out;
+
+    NSString *trimmed = [self trimmedPath:dir];
+    struct statfs sfs;
+    if (statfs(trimmed.fileSystemRepresentation, &sfs) != 0) return out;
+    fsid_t volume = sfs.f_fsid;
+
+    char prefix[PATH_MAX];
+    if (![trimmed getFileSystemRepresentation:prefix maxLength:PATH_MAX]) return out;
+    size_t plen = strlen(prefix);
+
+    char buf[PATH_MAX];
+    for (uint64_t ino = 1; ino <= limit; ino++) {
+        if ((ino & 0x3FFF) == 0) @autoreleasepool { }
+        if (gFSGetPath(buf, sizeof(buf), &volume, ino) <= 0) continue;
+        if (strncmp(buf, prefix, plen) != 0) continue;
+        if (buf[plen] != '/') continue;
+        if (strchr(buf + plen + 1, '/')) continue;
+
+        NSString *s = [[NSFileManager defaultManager]
+                       stringWithFileSystemRepresentation:buf length:strlen(buf)];
+        if (s && ![out containsObject:s]) [out addObject:s];
+    }
+    return out;
+}
+
++ (NSString *)trimmedPath:(NSString *)p {    NSString *s = p;
     while (s.length > 1 && [s hasSuffix:@"/"]) s = [s substringToIndex:s.length - 1];
     return s;
 }

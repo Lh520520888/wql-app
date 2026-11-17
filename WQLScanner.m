@@ -99,13 +99,15 @@ static NSString * const kWQLContainerMeta = @".com.apple.mobile_container_manage
 }
 
 - (NSArray<NSString *> *)defaultRoots {
+    // 只扫钱包所在的卷。实测（iPhone15,3 / 26.4.2）：
+    //   Application / AppGroup / InternalDaemon / PluginKitPlugin → 卷 16777226
+    //   System / SystemGroup                                     → 卷 16777222（另一个卷）
+    // 暴破是按卷走的，砍掉 System 两个根等于整卷不扫，耗时接近减半，且不含钱包数据。
     return @[
         @"/private/var/mobile/Containers/Data/Application",
         @"/private/var/mobile/Containers/Shared/AppGroup",
         @"/private/var/mobile/Containers/Data/InternalDaemon",
         @"/private/var/mobile/Containers/Data/PluginKitPlugin",
-        @"/private/var/containers/Data/System",
-        @"/private/var/containers/Shared/SystemGroup",
     ];
 }
 

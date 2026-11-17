@@ -117,12 +117,12 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
     }
     if (![self prepareWithError:error]) return buckets;
 
-    // 断点必须「按卷」记录：多个卷共用一个 nextInode，会让后一个卷跳过前半段
-    NSMutableDictionary<NSString *, NSNumber *> *resumeVolumes = [NSMutableDictionary dictionary];
+    // 断点 v3：每个卷记两个水位（lo/hi）。v2 的单水位按「正向进度」兼容。
+    NSMutableDictionary<NSString *, NSDictionary *> *resumeCursors = [NSMutableDictionary dictionary];
     NSMutableDictionary *resumeBuckets = nil;
     NSDictionary *cp = [NSDictionary dictionaryWithContentsOfFile:WQLLeakCheckpointPath()];
-    if ([cp isKindOfClass:[NSDictionary class]] &&
-        [cp[@"v"] intValue] == 2 &&
+    int cpVersion = [cp isKindOfClass:[NSDictionary class]] ? [cp[@"v"] intValue] : 0;
+    if ((cpVersion == 2 || cpVersion == 3) &&
         [cp[@"roots"] isEqual:directories] &&
         [cp[@"maxInode"] isKindOfClass:[NSNumber class]]) {
         double ts = [cp[@"ts"] doubleValue];
@@ -131,13 +131,19 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
             NSDictionary *pv = cp[@"volumes"];
             if ([pv isKindOfClass:[NSDictionary class]]) {
                 for (NSString *k in pv) {
-                    if ([pv[k] isKindOfClass:[NSNumber class]]) resumeVolumes[k] = pv[k];
+                    id v = pv[k];
+                    if ([v isKindOfClass:[NSDictionary class]]) {
+                        resumeCursors[k] = v;
+                    } else if ([v isKindOfClass:[NSNumber class]]) {
+                        // v2：只有正向水位，反向从头开始
+                        resumeCursors[k] = @{ @"lo": v, @"hi": @(maxInode + 1) };
+                    }
                 }
             }
             NSDictionary *pb = cp[@"buckets"];
             if ([pb isKindOfClass:[NSDictionary class]]) resumeBuckets = [pb mutableCopy];
-            WQLLogLine(@"【续扫】断点里有 %lu 个卷的进度，按卷继续",
-                       (unsigned long)resumeVolumes.count);
+            WQLLogLine(@"【续扫】断点里有 %lu 个卷的进度，按双向水位继续",
+                       (unsigned long)resumeCursors.count);
         }
     }
 
@@ -165,8 +171,12 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
         }
     }
 
-    // 每个卷从自己的断点开始；分母是各卷剩余跨度之和，进度不会超过 100%
-    NSMutableDictionary<NSString *, NSNumber *> *volStart = [NSMutableDictionary dictionary];
+    // 断点 v3：每个卷记两个水位（lo=正向已扫到哪，hi=反向待扫的最高位+1）。
+    // 先正向扫到 prefixEnd（拿低位容器，比如备忘录），再从 maxInode 反向扫回 prefixEnd。
+    static const uint64_t kPrefixEnd = 1000000ULL;
+    uint64_t prefixEnd = MIN(maxInode, MAX((uint64_t)1, kPrefixEnd));
+
+    NSMutableDictionary<NSString *, NSDictionary *> *volCursor = [NSMutableDictionary dictionary];
     uint64_t grandTotal = 0;
     for (NSString *vol in byVolume) {
         NSArray<NSString *> *dirs = byVolume[vol];
@@ -174,26 +184,28 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
         struct statfs t;
         if (!first || statfs(first.fileSystemRepresentation, &t) != 0) continue;
 
-        uint64_t s = 1;
-        NSNumber *sv = resumeVolumes[vol];
-        if (sv) s = MAX((uint64_t)1, sv.unsignedLongLongValue);
-        volStart[vol] = @(s);
-        if (s <= maxInode) grandTotal += (maxInode - s + 1);
+        uint64_t lo = 1, hi = maxInode + 1;
+        NSDictionary *saved = resumeCursors[vol];
+        if ([saved isKindOfClass:[NSDictionary class]]) {
+            lo = [saved[@"lo"] unsignedLongLongValue];
+            hi = [saved[@"hi"] unsignedLongLongValue];
+            if (lo < 1) lo = 1;
+            if (hi > maxInode + 1) hi = maxInode + 1;
+            if (hi < 1) hi = 1;
+        }
+        volCursor[vol] = @{ @"lo": @(lo), @"hi": @(hi) };
+        grandTotal += maxInode;
     }
 
-    NSMutableDictionary<NSString *, NSNumber *> *volNext = [volStart mutableCopy];
     uint64_t totalDone = 0;
     for (NSString *vol in byVolume) {
         NSArray<NSString *> *dirs = byVolume[vol];
-        NSNumber *startNum = volStart[vol];
-        if (!startNum) continue;
-        uint64_t from = startNum.unsignedLongLongValue;
-        uint64_t span = (maxInode >= from) ? (maxInode - from + 1) : 0;
-        if (span == 0) continue;
+        NSDictionary *cursor = volCursor[vol];
+        if (!cursor) continue;
 
         struct statfs sfs;
         if (statfs(dirs.firstObject.fileSystemRepresentation, &sfs) != 0) continue;
-        fsid_t fsid = sfs.f_fsid;
+        fsid_t volume = sfs.f_fsid;
 
         wql_prefix_t *prefixes = calloc(dirs.count, sizeof(wql_prefix_t));
         if (!prefixes) continue;
@@ -206,121 +218,98 @@ static const uint64_t kCheckpointInterval = 20;   // 秒：检查点写盘节流
             pc++;
         }
 
-        // 分块并行扫：32768 个 inode 一块，4 个 worker 抢块。
-        // 命中先落共享 bucket（加锁），再在串行队列里回调，保证采集侧不并发。
-        static const int64_t kChunk = 32768;
-        int64_t chunks = (int64_t)((span + (uint64_t)kChunk - 1) / (uint64_t)kChunk);
-
-        dispatch_queue_t callbacks = dispatch_queue_create("com.wql.pathcallbacks",
-                                                            DISPATCH_QUEUE_SERIAL);
-        NSLock *lock = [NSLock new];
-        NSMutableIndexSet *finished = [NSMutableIndexSet indexSet];
-        __block int64_t nextChunk = 0;
-        __block uint64_t doneHere = 0;
-        __block NSUInteger frontier = 0;
+        __block uint64_t lo = [cursor[@"lo"] unsignedLongLongValue];
+        __block uint64_t hi = [cursor[@"hi"] unsignedLongLongValue];
         __block BOOL stopAll = NO;
+        __block uint64_t doneHere = 0;
         __block NSTimeInterval lastSave = [NSDate date].timeIntervalSince1970;
+        char b[PATH_MAX];
 
-        // 实测 26.4.2 上 4 线程更慢（fsgetpath 被内核串行化），默认回到单线程；
-        // 需要对比时可用 WQLScanWorkers 覆盖。
-        NSInteger workers = [[NSUserDefaults standardUserDefaults] integerForKey:@"WQLScanWorkers"];
-        if (workers < 1 || workers > 8) workers = 1;
-        WQLLogLine(@"扫描线程：%ld", (long)workers);
+        // 单次 inode 处理：命中就写 bucket 并回调
+        void (^handleInode)(uint64_t) = ^(uint64_t ino) {
+            char buf[PATH_MAX];
+            fsid_t v = volume;
+            long n = gFSGetPath(buf, sizeof(buf), &v, ino);
+            if (n <= 0) return;
 
-        dispatch_apply((size_t)workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
-            char b[PATH_MAX];
-            fsid_t volume = fsid;   // block 里 fsid 是 const 副本，取地址要非 const
+            for (size_t i = 0; i < pc; i++) {
+                size_t plen = prefixes[i].len;
+                if (strncmp(buf, prefixes[i].prefix, plen) != 0) continue;
+                if (buf[plen] != '/') continue;
+                if (strchr(buf + plen + 1, '/')) continue;
 
-            for (;;) {
-                if (stopAll) return;
-
-                [lock lock];
-                int64_t c = nextChunk++;
-                [lock unlock];
-                if (c >= chunks) return;
-
-                uint64_t first = from + (uint64_t)c * (uint64_t)kChunk;
-                uint64_t last = MIN(first + (uint64_t)kChunk - 1, maxInode);
-
-                for (uint64_t ino = first; ino <= last; ino++) {
-                    if ((ino & 127) == 0 && cancel && cancel()) {
-                        stopAll = YES;
-                        return;
-                    }
-
-                    long n = gFSGetPath(b, sizeof(b), &volume, ino);
-                    if (n <= 0) continue;
-
-                    for (size_t i = 0; i < pc; i++) {
-                        size_t plen = prefixes[i].len;
-                        if (strncmp(b, prefixes[i].prefix, plen) != 0) continue;
-                        if (b[plen] != '/') continue;
-                        if (strchr(b + plen + 1, '/')) continue;
-
-                        NSString *s = [[NSFileManager defaultManager]
-                                       stringWithFileSystemRepresentation:b length:strlen(b)];
-                        if (s) {
-                            BOOL isNew = NO;
-                            [lock lock];
-                            NSMutableArray *bucket = buckets[prefixes[i].key];
-                            if (bucket && ![bucket containsObject:s]) {
-                                [bucket addObject:s];
-                                isNew = YES;
-                            }
-                            [lock unlock];
-
-                            if (isNew && onPath) {
-                                NSString *key = prefixes[i].key;
-                                dispatch_sync(callbacks, ^{
-                                    @autoreleasepool { onPath(key, s); }
-                                });
-                            }
-                        }
-                        break;
+                NSString *s = [[NSFileManager defaultManager]
+                               stringWithFileSystemRepresentation:buf length:strlen(buf)];
+                if (s) {
+                    NSMutableArray *bucket = buckets[prefixes[i].key];
+                    BOOL isNew = (bucket && ![bucket containsObject:s]);
+                    if (isNew) [bucket addObject:s];
+                    if (isNew && onPath) {
+                        @autoreleasepool { onPath(prefixes[i].key, s); }
                     }
                 }
-
-                [lock lock];
-                doneHere += (last - first + 1);
-                [finished addIndexesInRange:NSMakeRange((NSUInteger)c, 1)];
-                while ([finished containsIndex:frontier]) frontier++;
-                if (frontier > 0) [finished removeIndexesInRange:NSMakeRange(0, frontier)];
-                volNext[vol] = @(from + (uint64_t)frontier * (uint64_t)kChunk);
-
-                NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-                if (now - lastSave >= (NSTimeInterval)kCheckpointInterval) {
-                    lastSave = now;
-                    NSDictionary *ck = @{
-                        @"v": @(2),
-                        @"roots": directories,
-                        @"maxInode": @(maxInode),
-                        @"ts": @(now),
-                        @"buckets": buckets,
-                        @"volumes": volNext,
-                    };
-                    [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
-                }
-                if (progress) progress(totalDone + doneHere, grandTotal);
-                [lock unlock];
+                break;
             }
-        });
+        };
 
-        if (stopAll) {
-            wasCancelled = YES;
-            // 取消时立刻落一次断点，别丢掉最后 20 秒的发现
+        void (^saveCheckpoint)(void) = ^ {
             NSDictionary *ck = @{
-                @"v": @(2),
+                @"v": @(3),
                 @"roots": directories,
                 @"maxInode": @(maxInode),
                 @"ts": @([[NSDate date] timeIntervalSince1970]),
                 @"buckets": buckets,
-                @"volumes": volNext,
+                @"volumes": volCursor,
             };
             [ck writeToFile:WQLLeakCheckpointPath() atomically:YES];
+        };
+
+        // 阶段 1：正向 1 → prefixEnd（拿低位容器，备忘录在这里）
+        for (uint64_t ino = lo; ino <= prefixEnd; ino++) {
+            if ((ino & 127) == 0 && cancel && cancel()) { stopAll = YES; break; }
+            handleInode(ino);
+            lo = ino + 1;
+            doneHere++;
+
+            if ((ino % 32768) == 0) {
+                volCursor[vol] = @{ @"lo": @(lo), @"hi": @(hi) };
+                NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+                if (now - lastSave >= (NSTimeInterval)kCheckpointInterval) {
+                    lastSave = now;
+                    saveCheckpoint();
+                }
+                if (progress) progress(totalDone + doneHere, grandTotal);
+            }
+        }
+
+        // 阶段 2：反向 maxInode → prefixEnd+1（拿高位容器，钱包在这里）
+        if (!stopAll) {
+            for (uint64_t ino = hi - 1; ino > prefixEnd; ino--) {
+                if ((ino & 127) == 0 && cancel && cancel()) { stopAll = YES; break; }
+                handleInode(ino);
+                hi = ino;
+                doneHere++;
+
+                if ((ino % 32768) == 0) {
+                    volCursor[vol] = @{ @"lo": @(lo), @"hi": @(hi) };
+                    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+                    if (now - lastSave >= (NSTimeInterval)kCheckpointInterval) {
+                        lastSave = now;
+                        saveCheckpoint();
+                    }
+                    if (progress) progress(totalDone + doneHere, grandTotal);
+                }
+            }
+        }
+
+        if (stopAll) {
+            wasCancelled = YES;
+            volCursor[vol] = @{ @"lo": @(lo), @"hi": @(hi) };
+            saveCheckpoint();
         }
 
         free(prefixes);
-        totalDone += span;
+        totalDone += maxInode;
     }
 
     if (progress && grandTotal && !wasCancelled) progress(grandTotal, grandTotal);

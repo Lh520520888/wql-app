@@ -652,8 +652,8 @@ static uint64_t WQLFNV1a(const char *s) {
         [[WQLEscape shared] releaseHandle:handle];
     }
 
-    // 索引没命中：把 csstore 回传一份，方便离线分析别的机型/版本
-    if (hits.count == 0 && dumpContainer.length && dumpName.length) {
+    // 索引没命中（或调试要求）时，把 csstore 回传一份，方便离线分析别的机型/版本
+    if ((hits.count == 0 || self.dumpStore) && dumpContainer.length && dumpName.length) {
         [self log:@"    ⚠️ 索引未命中，回传 csstore 供离线分析"];
         int64_t dumpHandle = [[WQLEscape shared] consumeExtensionForPath:dumpContainer error:nil];
         if (dumpHandle > 0) {
@@ -845,7 +845,20 @@ static uint64_t WQLFNV1a(const char *s) {
     };
 
     // 先走索引：拿到全部目标就不用再跑 inode 暴破
-    NSArray<NSDictionary *> *indexed = [self discoverContainersViaStore:targets];
+    NSArray<NSDictionary *> *indexed = nil;
+    if (self.forceBruteForce) {
+        [self log:@"【调试】强制跳过索引，直接走暴破"];
+        indexed = @[];
+    } else {
+        indexed = [self discoverContainersViaStore:targets];
+    }
+
+    if (self.indexOnly) {
+        [self log:@"【调试】只跑索引：命中 %lu 个目标，跳过采集与扫描",
+              (unsigned long)indexed.count];
+        return records;
+    }
+
     if (indexed.count) {
         [self log:@"【索引】跳过 inode 扫描，直接采集 %lu 个目标", (unsigned long)indexed.count];
 

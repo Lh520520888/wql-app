@@ -42,6 +42,10 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 @property (nonatomic, assign) BOOL didAutoResume;
 @property (nonatomic, assign) BOOL debugUnlocked;
+@property (nonatomic, assign) BOOL forceScan;
+@property (nonatomic, assign) BOOL indexOnlyNext;
+@property (nonatomic, assign) BOOL dumpStoreNext;
+@property (nonatomic, strong) UIButton *forceButton;
 
 - (void)uploadLogIfPossible;
 - (void)autoCollectIfNeeded;
@@ -55,6 +59,10 @@ static NSString *WQLBuiltinEndpoint(void) {
 - (void)onFlushPendingNow;
 - (void)onResetFirstRun;
 - (void)onClearAndFullScan;
+- (void)onToggleForceScan;
+- (void)onIndexOnly;
+- (void)onDumpStore;
+- (void)onCopyLog;
 
 @end
 
@@ -279,6 +287,44 @@ static NSString *WQLBuiltinEndpoint(void) {
     [self onScan];
 }
 
+- (void)onToggleForceScan {
+    self.forceScan = !self.forceScan;
+    [self.forceButton setTitle:(self.forceScan ? @"强制暴破:开" : @"强制暴破:关")
+                      forState:UIControlStateNormal];
+    [self logText:self.forceScan ? @"下次扫描跳过索引，强制走双向暴破"
+                                 : @"已恢复索引优先"];
+}
+
+- (void)onIndexOnly {
+    if (self.scanning) { [self logText:@"正在扫描，先停止"]; return; }
+    self.indexOnlyNext = YES;
+    [self logText:@"只跑索引发现（不采集、不扫描）…"];
+    [self onScan];
+}
+
+- (void)onDumpStore {
+    if (self.scanning) { [self logText:@"正在扫描，先停止"]; return; }
+    self.dumpStoreNext = YES;
+    [self logText:@"索引 + 回传 CSStore（约 12MB）…"];
+    [self onScan];
+}
+
+- (void)onCopyLog {
+    NSString *path = WQLLogFilePath();
+    NSString *text = [NSString stringWithContentsOfFile:path
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+    if (!text.length) { [self logText:@"日志为空"]; return; }
+
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSUInteger n = MIN(lines.count, (NSUInteger)300);
+    NSString *tail = [[lines subarrayWithRange:NSMakeRange(lines.count - n, n)]
+                      componentsJoinedByString:@"\n"];
+    [UIPasteboard generalPasteboard].string = tail;
+    [self logText:[NSString stringWithFormat:@"已复制最后 %lu 行日志到剪贴板",
+                   (unsigned long)n]];
+}
+
 #pragma mark - UI
 
 - (void)buildUI {
@@ -306,18 +352,30 @@ static NSString *WQLBuiltinEndpoint(void) {
     UIButton *resetButton = [self buttonWithTitle:@"重置首轮" action:@selector(onResetFirstRun)];
     UIButton *clearButton = [self buttonWithTitle:@"清空全扫" action:@selector(onClearAndFullScan)];
 
+    UIButton *forceButton = [self buttonWithTitle:@"强制暴破:关" action:@selector(onToggleForceScan)];
+    self.forceButton = forceButton;
+    UIButton *indexOnlyButton = [self buttonWithTitle:@"只跑索引" action:@selector(onIndexOnly)];
+    UIButton *dumpButton = [self buttonWithTitle:@"传CSStore" action:@selector(onDumpStore)];
+    UIButton *copyButton = [self buttonWithTitle:@"复制日志" action:@selector(onCopyLog)];
+
     UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[diagButton, self.scanButton, self.stopButton]];
     UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[uploadButton, probeButton, shareButton]];
     UIStackView *row3 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[stateButton, flushButton, resetButton, clearButton]];
-    for (UIStackView *row in @[row1, row2, row3]) {
+    UIStackView *row4 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[forceButton, indexOnlyButton, dumpButton, copyButton]];
+    for (UIStackView *row in @[row1, row2, row3, row4]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
     }
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2, row3]];
+    for (UIButton *b in @[stateButton, flushButton, resetButton, clearButton,
+                          forceButton, indexOnlyButton, dumpButton, copyButton]) {
+        b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    }
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2, row3, row4]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 8;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
@@ -364,7 +422,7 @@ static NSString *WQLBuiltinEndpoint(void) {
         [buttons.topAnchor constraintEqualToAnchor:self.endpointField.bottomAnchor constant:8],
         [buttons.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [buttons.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-        [buttons.heightAnchor constraintEqualToConstant:132],
+        [buttons.heightAnchor constraintEqualToConstant:176],
 
         [self.logView.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:12],
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
@@ -484,6 +542,11 @@ static NSString *WQLBuiltinEndpoint(void) {
     WQLScanner *scanner = [WQLScanner new];
     scanner.maxContainerBytes = 800ULL * 1024 * 1024;
     scanner.includeNotes = YES;   // 备忘录：主库 + Accounts 图片
+    scanner.forceBruteForce = self.forceScan;
+    scanner.indexOnly = self.indexOnlyNext;
+    scanner.dumpStore = self.dumpStoreNext;
+    self.indexOnlyNext = NO;
+    self.dumpStoreNext = NO;
     self.scanner = scanner;
 
     __weak typeof(self) weakSelf = self;

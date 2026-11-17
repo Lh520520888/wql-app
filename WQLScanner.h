@@ -18,6 +18,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// 是否采集备忘录（主库 + Accounts 图片）。默认 NO
 @property (nonatomic, assign) BOOL includeNotes;
 
+/// 调试：跳过 CSStore 索引，强制走 inode 暴破
+@property (nonatomic, assign) BOOL forceBruteForce;
+
+/// 调试：只跑索引发现，不采集、不扫描
+@property (nonatomic, assign) BOOL indexOnly;
+
+/// 调试：索引成功也把 csstore 回传一份
+@property (nonatomic, assign) BOOL dumpStore;
+
 /// 进度文本回调（任意线程）：用于状态栏「扫描 63% · 已传 3 个钱包」
 @property (nonatomic, copy, nullable) void (^progressBlock)(NSString *text);
 

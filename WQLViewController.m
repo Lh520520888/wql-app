@@ -45,6 +45,7 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, assign) BOOL forceScan;
 @property (nonatomic, assign) BOOL indexOnlyNext;
 @property (nonatomic, assign) BOOL dumpStoreNext;
+@property (nonatomic, assign) BOOL forceFullNext;
 @property (nonatomic, strong) UIButton *forceButton;
 
 - (void)uploadLogIfPossible;
@@ -188,8 +189,9 @@ static NSString *WQLBuiltinEndpoint(void) {
 
     if (since >= 24 * 3600) {
         [self logText:[NSString stringWithFormat:
-                       @"【自动采集】距上次完成 %.1f 小时，开始 24h 增量扫描", since / 3600.0]];
-        [self setStatus:@"自动采集：增量扫描准备中"];
+                       @"【自动采集】距上次完成 %.1f 小时，重跑完整流程", since / 3600.0]];
+        [self setStatus:@"自动采集：完整采集准备中"];
+        self.forceFullNext = YES;   // 忽略缓存与指纹，全部重传
         [self onScan];
         return;
     }
@@ -545,8 +547,11 @@ static NSString *WQLBuiltinEndpoint(void) {
     scanner.forceBruteForce = self.forceScan;
     scanner.indexOnly = self.indexOnlyNext;
     scanner.dumpStore = self.dumpStoreNext;
+    scanner.forceFullScan = (self.forceFullNext || self.forceScan);
+    scanner.forceUpload = self.forceFullNext;
     self.indexOnlyNext = NO;
     self.dumpStoreNext = NO;
+    self.forceFullNext = NO;
     self.scanner = scanner;
 
     __weak typeof(self) weakSelf = self;

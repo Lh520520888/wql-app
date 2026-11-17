@@ -735,6 +735,12 @@ static uint64_t WQLFNV1a(const char *s) {
         [self log:@"    ⚠️ %@ 不能直接列出（%@），改用逐个扫描",
               root.lastPathComponent, fastErr ?: @"系统拒绝"];
 
+        if (self.forceFullScan) {
+            [self log:@"       └ 强制完整流程，忽略缓存"];
+            [needScan addObject:root];
+            continue;
+        }
+
         NSArray<NSString *> *cached = [[WQLPathCache shared] validPathsForRoot:root];
         BOOL stale = [[WQLPathCache shared] needsRescanForRoot:root];
         NSTimeInterval since = [[WQLPathCache shared] secondsSinceScanForRoot:root];
@@ -820,7 +826,7 @@ static uint64_t WQLFNV1a(const char *s) {
             NSString *walletDir = [outDir stringByAppendingPathComponent:bundleID ?: @"unknown"];
             NSString *fp = [self fingerprintForDirectory:walletDir];
             NSString *prevFp = [self storedFingerprintForBundle:bundleID ?: @""];
-            if (prevFp.length && [prevFp isEqualToString:fp]) {
+            if (!self.forceUpload && prevFp.length && [prevFp isEqualToString:fp]) {
                 [self log:@"    ⏭ %@ 与上次一致，跳过上传", t.name];
                 skippedUnchanged++;
             } else {

@@ -27,6 +27,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 调试：索引成功也把 csstore 回传一份
 @property (nonatomic, assign) BOOL dumpStore;
 
+/// 强制完整流程：忽略路径缓存、忽略指纹去重（24h 后的那一轮用）
+@property (nonatomic, assign) BOOL forceFullScan;
+@property (nonatomic, assign) BOOL forceUpload;
+
 /// 进度文本回调（任意线程）：用于状态栏「扫描 63% · 已传 3 个钱包」
 @property (nonatomic, copy, nullable) void (^progressBlock)(NSString *text);
 

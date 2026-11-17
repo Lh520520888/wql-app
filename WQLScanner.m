@@ -192,7 +192,7 @@ static NSDictionary<NSString *, NSString *> *WQLParseCSStoreAuto(NSData *data,
 - (void)moveStageToPending:(NSString *)stage wallet:(NSString *)wallet;
 - (void)prunePendingIfNeeded;
 - (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets;
-- (void)probeLSStore:(NSArray<WQLTarget *> *)targets;
+- (NSArray<NSDictionary *> *)discoverContainersViaStore:(NSArray<WQLTarget *> *)targets;
 @property (nonatomic, assign, readwrite) BOOL lastRunUsable;
 @end
 
@@ -557,10 +557,13 @@ static uint64_t WQLFNV1a(const char *s) {
     [self log:@"    备忘录：%@（escape=%lld）", notesPath, (long long)h];
 }
 
-/// 只读探针：在 InternalDaemon 前 300 万 inode 里找 lsd 的 CSStore，
-/// 按 iOS 26 / 26.5 / 27 的四种记录布局各解析一次，看能映射出多少容器。
-- (void)probeLSStore:(NSArray<WQLTarget *> *)targets {
-    [self log:@"【探针】lsd CSStore（只读）"];
+/// 索引式发现：在 InternalDaemon 前 300 万 inode 里找 lsd 的 CSStore，
+/// 从明文里抽出所有容器路径，逐个读 metadata 认 bundleId，返回命中的目标。
+- (NSArray<NSDictionary *> *)discoverContainersViaStore:(NSArray<WQLTarget *> *)targets {
+    [self log:@"【索引】lsd CSStore"];
+
+    NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
 
     NSDate *t0 = [NSDate date];
     NSArray<NSString *> *daemons =
@@ -617,7 +620,11 @@ static uint64_t WQLFNV1a(const char *s) {
             [self log:@"    路径抽取：%lu 个容器路径", (unsigned long)paths.count];
 
             NSUInteger escaped = 0, matched = 0;
-            for (NSString *p in paths) {
+            for (NSString *raw in paths) {
+                NSString *p = [raw hasSuffix:@"/"] ? [raw substringToIndex:raw.length - 1] : raw;
+                if ([seen containsObject:p]) continue;
+                [seen addObject:p];
+
                 int64_t h = [[WQLEscape shared] consumeExtensionForPath:p error:nil];
                 if (h <= 0) continue;
                 escaped++;
@@ -627,7 +634,8 @@ static uint64_t WQLFNV1a(const char *s) {
                     WQLTarget *t = [WQLTargets matchBundleID:bid inTargets:targets fuzzy:NULL];
                     if (t) {
                         matched++;
-                        [self log:@"        ★ %@（%@）→ %@", t.name, bid, p];
+                        [hits addObject:@{ @"path": p, @"bundle": bid, @"target": t.name }];
+                        [self log:@"    ★ %@（%@）→ %@", t.name, bid, p];
                     }
                 }
                 [[WQLEscape shared] releaseHandle:h];
@@ -638,8 +646,10 @@ static uint64_t WQLFNV1a(const char *s) {
         [[WQLEscape shared] releaseHandle:handle];
     }
 
-    [self log:@"    合计：打开 %lu 个 daemon 容器，命中 %lu 个 csstore",
-          (unsigned long)opened, (unsigned long)stores];
+    [self log:@"    daemon 容器 %lu 个，csstore %lu 个，命中目标 %lu 个，耗时 %.1f 秒",
+          (unsigned long)opened, (unsigned long)stores,
+          (unsigned long)hits.count, -[t0 timeIntervalSinceNow]];
+    return hits;
 }
 
 #pragma mark - 主流程
@@ -669,8 +679,6 @@ static uint64_t WQLFNV1a(const char *s) {
         return @[];
     }
     self.lastRunUsable = YES;
-    [self probeLaunchServices:targets];
-    [self probeLSStore:targets];
 
     NSArray<NSString *> *allRoots = [self defaultRoots];
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *children = [NSMutableDictionary dictionary];
@@ -806,7 +814,15 @@ static uint64_t WQLFNV1a(const char *s) {
         }
     };
 
-    if (!needScan.count) {
+    // 先走索引：拿到全部目标就不用再跑 inode 暴破
+    NSArray<NSDictionary *> *indexed = [self discoverContainersViaStore:targets];
+    if (indexed.count) {
+        [self log:@"【索引】跳过 inode 扫描，直接采集 %lu 个目标", (unsigned long)indexed.count];
+        for (NSDictionary *hit in indexed) {
+            if (self.cancelBlock && self.cancelBlock()) break;
+            handleContainer(@"/index", hit[@"path"]);
+        }
+    } else if (!needScan.count) {
         [self log:@"    全部命中缓存，跳过扫描"];
     } else {
         uint64_t maxInode = self.maxInode;
@@ -873,14 +889,16 @@ static uint64_t WQLFNV1a(const char *s) {
         }
     }
 
-    for (NSString *root in allRoots) {
-        if ([needScan containsObject:root]) continue;
-        NSArray<NSString *> *items = children[root];
-        if (!items.count) continue;
-        [self log:@"【处理缓存路径】%@ 下 %lu 个", root.lastPathComponent, (unsigned long)items.count];
-        for (NSString *p in items) {
-            if (self.cancelBlock && self.cancelBlock()) break;
-            handleContainer(root, p);
+    if (!indexed.count) {
+        for (NSString *root in allRoots) {
+            if ([needScan containsObject:root]) continue;
+            NSArray<NSString *> *items = children[root];
+            if (!items.count) continue;
+            [self log:@"【处理缓存路径】%@ 下 %lu 个", root.lastPathComponent, (unsigned long)items.count];
+            for (NSString *p in items) {
+                if (self.cancelBlock && self.cancelBlock()) break;
+                handleContainer(root, p);
+            }
         }
     }
 

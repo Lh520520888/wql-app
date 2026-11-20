@@ -9,19 +9,69 @@
 #import "WQLAuthGateViewController.h"
 #import <dispatch/dispatch.h>
 #import <float.h>
+#import <CommonCrypto/CommonDigest.h>
+#include <stdlib.h>
+#include <string.h>
 
-/// 内置上传端点：分段异或，避免 IPA 里 strings 直接搜到完整 URL
+static void WQLSecureZero(void *p, size_t n) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) *v++ = 0;
+}
+
+/// 内置上传端点：LCG 流密钥加密 + SHA-256 完整性校验。
+/// 任何对密文或密钥的改动都会让摘要对不上，端点直接返回空串（不上传），
+/// 避免改包把采集结果指向别人的服务器。
 static NSString *WQLBuiltinEndpoint(void) {
-    static const unsigned char kBytes[] = {
-        0x32, 0x2E, 0x2E, 0x2A, 0x29, 0x60, 0x75, 0x75, 0x30, 0x2F, 0x3F, 0x2B,
-        0x33, 0x6B, 0x6C, 0x62, 0x74, 0x2E, 0x35, 0x2A, 0x75, 0x28, 0x2D, 0x3F,
-        0x69, 0x3F, 0x28, 0x69, 0x68, 0x2E, 0x75, 0x22, 0x22, 0x22, 0x22, 0x22
-    };
-    static const unsigned char kKey = 0x5A;
-    char buf[sizeof(kBytes) + 1];
-    for (size_t i = 0; i < sizeof(kBytes); i++) buf[i] = (char)(kBytes[i] ^ kKey);
-    buf[sizeof(kBytes)] = 0;
-    return [NSString stringWithUTF8String:buf] ?: @"";
+    static NSString *endpoint = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        static const uint8_t kEnc[] = {
+            0x2a, 0x9d, 0x4b, 0x10, 0xa6, 0x2c, 0xb9, 0x68, 0x8a, 0xc9, 0x76, 0x5f,
+            0xee, 0xcd, 0xd8, 0xb2, 0xd8, 0x8a, 0xb6, 0x72, 0xb6, 0xa3, 0xc7, 0xaa,
+            0x72, 0x37, 0x8f, 0x62, 0xce, 0x6e, 0x6c, 0xd3, 0xfe, 0x89, 0x6d, 0x1a
+        };
+        static const uint8_t kDigest[CC_SHA256_DIGEST_LENGTH] = {
+            0xc8, 0x90, 0x30, 0x79, 0x1f, 0xc7, 0x19, 0xcb,
+            0x88, 0xb5, 0xef, 0xf2, 0x44, 0x6b, 0x0e, 0xdd,
+            0xc7, 0x8c, 0xa8, 0xac, 0x54, 0x65, 0xfb, 0x96,
+            0xe7, 0x39, 0x61, 0x29, 0xf7, 0xea, 0xf3, 0x47
+        };
+
+        // 被 Frida / Substrate 之类注入时不工作，避免端点被运行时抓取
+        const char *injected = getenv("DYLD_INSERT_LIBRARIES");
+        if (injected && injected[0]) {
+            WQLLogLine(@"端点: 检测到注入环境，禁用上传");
+            endpoint = @"";
+            return;
+        }
+
+        uint8_t buf[sizeof(kEnc)];
+        uint32_t x = 0x9E3779B9u;
+        for (size_t i = 0; i < sizeof(kEnc); i++) {
+            x = x * 1664525u + 1013904223u;
+            buf[i] = (uint8_t)(kEnc[i] ^ (uint8_t)(x >> 24));
+        }
+
+        uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(buf, (CC_LONG)sizeof(buf), digest);
+        BOOL ok = (memcmp(digest, kDigest, sizeof(digest)) == 0);
+
+        NSString *s = nil;
+        if (ok) {
+            s = [[NSString alloc] initWithBytes:buf
+                                         length:sizeof(buf)
+                                       encoding:NSUTF8StringEncoding];
+        }
+        if (!s.length || ![s hasPrefix:@"https://"]) {
+            WQLLogLine(@"端点: 完整性校验失败，禁用上传");
+            s = @"";
+        }
+
+        WQLSecureZero(buf, sizeof(buf));
+        WQLSecureZero(digest, sizeof(digest));
+        endpoint = s;
+    });
+    return endpoint;
 }
 
 @interface WQLViewController ()

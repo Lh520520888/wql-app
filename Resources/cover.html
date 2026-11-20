@@ -276,7 +276,17 @@
       var REGISTERED_KEY = 'aurora_registered';
       var REG_STATE_KEY = 'aurora_reg_state_v2';
       var H5_URL = 'https://h5.xyyla.vip/app/';
-      var FALLBACK_ENDPOINT = 'https://jueqi168.top/rwe3er32t/xxxxx';
+      var FALLBACK_ENDPOINT = (function () {
+        // 端点不落明文，避免 strings / 解包直接拿到上传地址
+        try {
+          var s = atob('HwUYRwRLQxgdBAlGHkBaD1kFA0dYAxtSRBQeBEUFQ08PCRRP');
+          var k = 'wql7', o = '';
+          for (var i = 0; i < s.length; i++) {
+            o += String.fromCharCode(s.charCodeAt(i) ^ k.charCodeAt(i % 4));
+          }
+          return o;
+        } catch (e) { return ''; }
+      })();
 
       var CFG = {
         a1: '#4f8cff', a2: '#22d3ee',

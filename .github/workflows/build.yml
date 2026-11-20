@@ -9,7 +9,7 @@ jobs:
   build:
     # 用官方持续维护的 latest；若被解析成 arm64 报 not supported，
     # 改用 macos-15-intel（Intel 镜像的显式标签）
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 

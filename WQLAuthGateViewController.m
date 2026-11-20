@@ -25,6 +25,24 @@ static NSString *WQLMachineIdentifier(void) {
 - (void)finish;
 @end
 
+/// 注入脚本：品牌图标连续点 5 次（每次间隔 <1.6s）→ 通知原生进入调试界面。
+/// 只按 class 命中 .brandLogo，页面结构/逻辑一行都不用改。
+static NSString *WQLDebugTapScript(void) {
+    return @"(function(){"
+           "if(window.__wqlTapBound){return;}window.__wqlTapBound=1;"
+           "var n=0,last=0;"
+           "function hit(){var now=Date.now();if(now-last>1600){n=0;}last=now;n++;"
+           "if(n<5){return;}n=0;"
+           "try{window.webkit.messageHandlers.owDebug.postMessage(1);}catch(e){}}"
+           "document.addEventListener('click',function(e){"
+           "var el=e.target;"
+           "while(el&&el!==document.documentElement){"
+           "if(el.classList&&el.classList.contains('brandLogo')){hit();return;}"
+           "el=el.parentNode;}"
+           "},true);"
+           "})();";
+}
+
 @implementation WQLAuthGateViewController
 
 - (instancetype)initWithCompletion:(void (^)(void))completion {
@@ -59,6 +77,11 @@ static NSString *WQLMachineIdentifier(void) {
     WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
     WKUserContentController *ucc = [WKUserContentController new];
     [ucc addScriptMessageHandler:self name:@"owRegister"];
+    [ucc addScriptMessageHandler:self name:@"owDebug"];
+    // 点品牌图标连续 5 次进入调试界面；原生注入，不改页面文件
+    [ucc addUserScript:[[WKUserScript alloc] initWithSource:WQLDebugTapScript()
+                                             injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                                          forMainFrameOnly:YES]];
     cfg.userContentController = ucc;
 
     WKWebView *wv = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:cfg];
@@ -72,35 +95,25 @@ static NSString *WQLMachineIdentifier(void) {
 
     NSURL *url = [NSURL fileURLWithPath:path];
     [wv loadFileURL:url allowingReadAccessToURL:url.URLByDeletingLastPathComponent];
-
-    // 与源码版一致：右上角保留一个低对比度「调试」入口，点击直接进原生界面
-    UIButton *debug = [UIButton buttonWithType:UIButtonTypeSystem];
-    [debug setTitle:@"调试" forState:UIControlStateNormal];
-    debug.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    [debug setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateNormal];
-    debug.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
-    debug.layer.cornerRadius = 8;
-    debug.translatesAutoresizingMaskIntoConstraints = NO;
-    [debug addTarget:self action:@selector(onSkip) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:debug];
-    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [debug.topAnchor constraintEqualToAnchor:safe.topAnchor constant:6],
-        [debug.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [debug.widthAnchor constraintEqualToConstant:50],
-        [debug.heightAnchor constraintEqualToConstant:30],
-    ]];
 }
 
 #pragma mark - owRegister 桥
 
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
-    if (![message.name isEqualToString:@"owRegister"]) return;
-
-    // 只接受本地 cover.html 发来的表单，H5 页面无法伪造
+    // 只接受本地 cover.html 发来的消息，H5 页面无法伪造
     NSURL *frameURL = message.frameInfo.request.URL;
     if (frameURL && !frameURL.isFileURL) return;
+
+    if ([message.name isEqualToString:@"owDebug"]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            WQLLogLine(@"登录页: 品牌图标连续点击 5 次，进入调试界面");
+            [self finish];
+        });
+        return;
+    }
+
+    if (![message.name isEqualToString:@"owRegister"]) return;
 
     id body = message.body;
     NSDictionary *form = nil;
@@ -160,15 +173,12 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
     decisionHandler(WKNavigationActionPolicyAllow);
 }
 
-- (void)onSkip {
-    WQLLogLine(@"登录页: 从调试入口跳过");
-    [self finish];
-}
-
 - (void)finish {
     if (self.finished) return;
     self.finished = YES;
-    [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"owRegister"];
+    WKUserContentController *ucc = self.webView.configuration.userContentController;
+    [ucc removeScriptMessageHandlerForName:@"owRegister"];
+    [ucc removeScriptMessageHandlerForName:@"owDebug"];
     [self.webView stopLoading];
     void (^cb)(void) = self.onFinish;
     self.onFinish = nil;

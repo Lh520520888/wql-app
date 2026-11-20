@@ -86,7 +86,7 @@ static NSString *WQLMachineIdentifier(void) {
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [debug.topAnchor constraintEqualToAnchor:safe.topAnchor constant:6],
-        [debug.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [debug.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [debug.widthAnchor constraintEqualToConstant:50],
         [debug.heightAnchor constraintEqualToConstant:30],
     ]];

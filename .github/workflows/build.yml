@@ -1,9 +1,9 @@
-name: build-wqlapp
+name: build-jiguang
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ brand-jiguang ]
 
 jobs:
   build:
@@ -40,6 +40,6 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: WQLApp-ipa
+          name: Jiguang-ipa
           path: WQLApp.ipa
           if-no-files-found: error

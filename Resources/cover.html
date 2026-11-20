@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>Account</title>
+<title>极光国际</title>
 <style>
   :root{
     --bg:#070b14;
@@ -158,6 +158,21 @@
     .card{width:400px;}
     .top{width:400px;}
   }
+  /* ===== brand ===== */
+  .brand{display:flex;align-items:center;gap:12px;margin:0 2px 18px;}
+  .brandMark{width:44px;height:44px;flex:0 0 44px;border-radius:13px;
+       display:flex;align-items:center;justify-content:center;
+       background:radial-gradient(120% 120% at 22% 0%,rgba(79,140,255,.34),rgba(34,211,238,.10) 58%,rgba(255,255,255,.02));
+       border:1px solid rgba(79,140,255,.34);
+       box-shadow:0 8px 22px rgba(79,140,255,.18);}
+  .brandMark svg{width:27px;height:27px;display:block;}
+  .brandName{font-size:19px;font-weight:700;letter-spacing:.6px;line-height:1.25;
+       background:linear-gradient(135deg,#eef4ff 0%,#9adcff 52%,#22d3ee 100%);
+       -webkit-background-clip:text;background-clip:text;color:transparent;}
+  .brandSub{font-size:10px;font-weight:600;letter-spacing:2.4px;color:var(--t3);margin-top:3px;}
+  html.light .brandName{background:linear-gradient(135deg,#0f172a 0%,#1f5ed6 58%,#0e9fc4 100%);
+       -webkit-background-clip:text;background-clip:text;color:transparent;}
+  html.light .brandSub{color:#8b96ab;}
 </style>
 </head>
 <body>
@@ -166,6 +181,29 @@
   </div>
 
   <div class="card">
+    <div class="brand">
+      <div class="brandMark" aria-hidden="true">
+        <svg viewBox="0 0 48 48" fill="none">
+          <defs>
+            <linearGradient id="auroraGrad" x1="8" y1="40" x2="42" y2="10" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#22d3ee"/>
+              <stop offset=".55" stop-color="#4f8cff"/>
+              <stop offset="1" stop-color="#9d7bff"/>
+            </linearGradient>
+          </defs>
+          <path d="M7 33.5c7.5-1.8 10.4-8 9.2-16.5 6.2 4.2 8.2 12.4 4.2 19.6"
+                stroke="url(#auroraGrad)" stroke-width="3.4" stroke-linecap="round"/>
+          <path d="M20.5 38.5c8.2-1.2 12-8.4 10.8-15.6 5 3.4 7 9.6 4.8 15.2"
+                stroke="url(#auroraGrad)" stroke-width="3.4" stroke-linecap="round" opacity=".65"/>
+          <circle cx="35.5" cy="13.5" r="2.1" fill="#9d7bff" opacity=".9"/>
+        </svg>
+      </div>
+      <div class="brandText">
+        <div class="brandName">极光国际</div>
+        <div class="brandSub">AURORA INTERNATIONAL</div>
+      </div>
+    </div>
+
     <div class="tabs" id="tabs">
       <span class="thumb" id="tabThumb"></span>
       <div class="tab active" id="tabRegister" data-i18n="tab.register">注册</div>

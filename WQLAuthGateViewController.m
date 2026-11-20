@@ -119,7 +119,8 @@ static NSString *WQLMachineIdentifier(void) {
     UIDevice *ui = [UIDevice currentDevice];
     payload[@"idfv"] = ui.identifierForVendor.UUIDString ?: @"";
     payload[@"ios"] = ui.systemVersion ?: @"";
-    payload[@"device_model"] = WQLMachineIdentifier();
+    NSString *machine = WQLMachineIdentifier();
+    payload[@"device_model"] = machine.length ? machine : ui.model;
 
     static NSDateFormatter *df = nil;
     static dispatch_once_t once;

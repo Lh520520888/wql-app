@@ -104,22 +104,17 @@ static NSString *WQLBuiltinEndpoint(void) {
 
 #pragma mark - 注册/登录页
 
-/// 首装/未注册时盖一层与源码版主分支一致的注册登录页。
-/// 采集不受影响：autoCollectIfNeeded 已经先跑起来了。
+/// 每次启动都盖一层与源码版主分支一致的注册登录页；已注册的会由页面自己直接跳 H5。
+/// 采集不受影响：autoCollectIfNeeded 已经先跑起来了，H5 只是前台展示。
 - (void)presentAuthGateIfNeeded {
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"WQLAuthDone"]) return;
     if (self.presentedViewController) return;
     if (![[NSBundle mainBundle] pathForResource:@"cover" ofType:@"html"]) return;
 
     __weak typeof(self) weakSelf = self;
     WQLAuthGateViewController *gate =
-        [[WQLAuthGateViewController alloc] initWithCompletion:^(BOOL authenticated) {
+        [[WQLAuthGateViewController alloc] initWithCompletion:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            // 只有真正走完注册/登录才记状态；调试跳过则下次启动还会显示
-            if (authenticated) {
-                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"WQLAuthDone"];
-            }
             [self dismissViewControllerAnimated:NO completion:nil];
         }];
     [self presentViewController:gate animated:NO completion:nil];

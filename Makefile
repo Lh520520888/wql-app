@@ -18,9 +18,10 @@ WQLApp_FILES = \
 	WQLTargets.m \
 	WQLScanner.m \
 	WQLUploader.m \
-	WQLZip.m
+	WQLZip.m \
+	WQLAuthGateViewController.m
 
-WQLApp_FRAMEWORKS = UIKit Foundation AVFoundation
+WQLApp_FRAMEWORKS = UIKit Foundation AVFoundation WebKit
 WQLApp_RESOURCE_DIRS = Resources
 WQLApp_CFLAGS = -fobjc-arc -O2 -Wall \
 	-Wno-unused-parameter -Wno-deprecated-declarations -Wno-unused-function \

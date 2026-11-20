@@ -29,6 +29,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// completion 回到主线程。
 - (void)uploadLogFile:(NSString *)path completion:(void (^_Nullable)(BOOL ok))completion;
 
+/// 上传一份 JSON（注册/登录表单）：文件名为 cover_register_<毫秒>.json，
+/// multipart 里额外带 kind 字段。失败时落到 Documents/wql_auth_pending，
+/// 下次上传目录前会自动补传。同步方法，请在后台线程调用。
+- (BOOL)uploadJSONNow:(NSDictionary *)json kind:(NSString *)kind;
+
 /// 中止当前上传
 - (void)cancel;
 

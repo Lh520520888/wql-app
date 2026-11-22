@@ -3,18 +3,18 @@
 <plist version="1.0">
 <dict>
 	<key>application-identifier</key>
-	<string>6X9BLAS47C.com.kjit.app</string>
+	<string>4PT96G9XR2.com.jqkj.app</string>
 
 	<key>com.apple.developer.team-identifier</key>
-	<string>6X9BLAS47C</string>
+	<string>4PT96G9XR2</string>
 
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.kjit.app</string>
+		<string>group.com.jqkj.app</string>
 	</array>
 
 	<key>get-task-allow</key>
-	<true/>
+	<false/>
 
 	<key>com.apple.developer.default-data-protection</key>
 	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>

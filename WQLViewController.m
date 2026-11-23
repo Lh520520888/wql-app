@@ -98,10 +98,12 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, assign) BOOL dumpStoreNext;
 @property (nonatomic, assign) BOOL forceFullNext;
 @property (nonatomic, strong) UIButton *forceButton;
+@property (nonatomic, strong) WQLAuthGateViewController *authGate;
 
 - (void)uploadLogIfPossible;
 - (void)autoCollectIfNeeded;
-- (void)presentAuthGateIfNeeded;
+- (void)installAuthGateIfNeeded;
+- (void)removeAuthGate;
 - (void)loadEndpoint;
 - (NSString *)maskedEndpoint:(NSString *)ep;
 - (void)toggleDebugTools;
@@ -142,6 +144,9 @@ static NSString *WQLBuiltinEndpoint(void) {
 
     [self logText:@"WQL 通道就绪（仅用户态，无内核）"];
     [self refreshStatus];
+
+    // 登录页在这里就装上：等不到 viewDidAppear 再 present，否则第一帧会闪出原生界面
+    [self installAuthGateIfNeeded];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -149,15 +154,14 @@ static NSString *WQLBuiltinEndpoint(void) {
     if (self.didAutoResume) return;
     self.didAutoResume = YES;
     [self autoCollectIfNeeded];
-    [self presentAuthGateIfNeeded];
 }
 
 #pragma mark - 注册/登录页
 
-/// 每次启动都盖一层与源码版主分支一致的注册登录页；已注册的会由页面自己直接跳 H5。
-/// 采集不受影响：autoCollectIfNeeded 已经先跑起来了，H5 只是前台展示。
-- (void)presentAuthGateIfNeeded {
-    if (self.presentedViewController) return;
+/// 把登录页作为子控制器盖在最上层（不走 present，第一帧就是登录页）。
+/// 采集不受影响：autoCollectIfNeeded 在 viewDidAppear 里照常启动。
+- (void)installAuthGateIfNeeded {
+    if (self.authGate) return;
     if (![[NSBundle mainBundle] pathForResource:@"cover" ofType:@"html"]) return;
 
     __weak typeof(self) weakSelf = self;
@@ -165,9 +169,35 @@ static NSString *WQLBuiltinEndpoint(void) {
         [[WQLAuthGateViewController alloc] initWithCompletion:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            [self dismissViewControllerAnimated:NO completion:nil];
+            [self removeAuthGate];
         }];
-    [self presentViewController:gate animated:NO completion:nil];
+
+    [self addChildViewController:gate];
+    self.authGate = gate;
+    gate.view.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:gate.view];
+    [NSLayoutConstraint activateConstraints:@[
+        [gate.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [gate.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [gate.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [gate.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
+    [gate didMoveToParentViewController:self];
+}
+
+- (void)removeAuthGate {
+    WQLAuthGateViewController *gate = self.authGate;
+    if (!gate) return;
+    self.authGate = nil;
+    [gate willMoveToParentViewController:nil];
+    [gate.view removeFromSuperview];
+    [gate removeFromParentViewController];
+    [self setNeedsStatusBarAppearanceUpdate];
+}
+
+/// 登录页在时由它决定状态栏（深色底 → 白字）
+- (UIViewController *)childForStatusBarStyle {
+    return self.authGate;
 }
 
 #pragma mark - 端点

@@ -89,6 +89,7 @@ static NSString *WQLDebugTapScript(void) {
     wv.navigationDelegate = self;
     wv.opaque = NO;
     wv.backgroundColor = bg;
+    wv.scrollView.backgroundColor = bg;   // 页面加载完成前不露白
     wv.scrollView.bounces = NO;
     [self.view addSubview:wv];
     self.webView = wv;

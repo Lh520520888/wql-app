@@ -24,6 +24,11 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                idfv);
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // 与登录页同色：避免从启动屏切到第一帧时闪一下别的底色
+    self.window.backgroundColor = [UIColor colorWithRed:7.0 / 255.0
+                                                  green:11.0 / 255.0
+                                                   blue:20.0 / 255.0
+                                                  alpha:1.0];
     self.window.rootViewController = [WQLViewController new];
     [self.window makeKeyAndVisible];
 

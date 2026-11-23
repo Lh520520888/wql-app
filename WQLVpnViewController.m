@@ -339,20 +339,20 @@ static UIColor *WQLRGBA(uint32_t v, CGFloat a) {
 
     UIButton *power = [UIButton buttonWithType:UIButtonTypeSystem];
     power.translatesAutoresizingMaskIntoConstraints = NO;
-    [power setImage:[UIImage systemImageNamed:@"power"] forState:UIControlStateNormal];
+    UIImageSymbolConfiguration *symCfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:34 weight:UIImageSymbolWeightRegular];
+    UIImage *powerImg = [UIImage systemImageNamed:@"power" withConfiguration:symCfg];
+    [power setImage:powerImg forState:UIControlStateNormal];
     power.tintColor = WQLRGB(0xF2F5FB);
     power.backgroundColor = WQLRGBA(0xFFFFFF, 0.06);
     power.layer.cornerRadius = 44;
     power.layer.borderWidth = 1;
     power.layer.borderColor = WQLRGBA(0xFFFFFF, 0.12).CGColor;
-    power.imageEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 0);
     [power addTarget:self action:@selector(onPower) forControlEvents:UIControlEventTouchUpInside];
     [ringHost addSubview:power];
     self.powerButton = power;
     power.imageView.contentMode = UIViewContentModeScaleAspectFit;
     power.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-    [power setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:34 weight:UIImageSymbolWeightRegular]
-                                 forState:UIControlStateNormal];
 
     UILabel *status = [UILabel new];
     status.translatesAutoresizingMaskIntoConstraints = NO;

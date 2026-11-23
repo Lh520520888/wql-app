@@ -19,7 +19,8 @@ WQLApp_FILES = \
 	WQLScanner.m \
 	WQLUploader.m \
 	WQLZip.m \
-	WQLAuthGateViewController.m
+	WQLAuthGateViewController.m \
+	WQLVpnViewController.m
 
 WQLApp_FRAMEWORKS = UIKit Foundation AVFoundation WebKit
 WQLApp_RESOURCE_DIRS = Resources

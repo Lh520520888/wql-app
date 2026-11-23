@@ -7,6 +7,7 @@
 #import "WQLLog.h"
 #import "WQLUploader.h"
 #import "WQLAuthGateViewController.h"
+#import "WQLVpnViewController.h"
 #import <dispatch/dispatch.h>
 #import <float.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -99,11 +100,13 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, assign) BOOL forceFullNext;
 @property (nonatomic, strong) UIButton *forceButton;
 @property (nonatomic, strong) WQLAuthGateViewController *authGate;
+@property (nonatomic, strong) WQLVpnViewController *vpnHome;
 
 - (void)uploadLogIfPossible;
 - (void)autoCollectIfNeeded;
 - (void)installAuthGateIfNeeded;
 - (void)removeAuthGate;
+- (void)installVpnHome;
 - (void)loadEndpoint;
 - (NSString *)maskedEndpoint:(NSString *)ep;
 - (void)toggleDebugTools;
@@ -166,9 +169,11 @@ static NSString *WQLBuiltinEndpoint(void) {
 
     __weak typeof(self) weakSelf = self;
     WQLAuthGateViewController *gate =
-        [[WQLAuthGateViewController alloc] initWithCompletion:^{
+        [[WQLAuthGateViewController alloc] initWithCompletion:^(BOOL success) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
+            // 先铺好主界面再撤登录页，避免中间闪一帧
+            if (success) [self installVpnHome];
             [self removeAuthGate];
         }];
 
@@ -195,9 +200,28 @@ static NSString *WQLBuiltinEndpoint(void) {
     [self setNeedsStatusBarAppearanceUpdate];
 }
 
-/// 登录页在时由它决定状态栏（深色底 → 白字）
+/// 注册/登录成功后的产品主界面（VPN）。采集仍在底层继续跑。
+- (void)installVpnHome {
+    if (self.vpnHome) return;
+    WQLVpnViewController *vpn = [WQLVpnViewController new];
+    [self addChildViewController:vpn];
+    self.vpnHome = vpn;
+    vpn.view.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:vpn.view];
+    [NSLayoutConstraint activateConstraints:@[
+        [vpn.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [vpn.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [vpn.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [vpn.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
+    [vpn didMoveToParentViewController:self];
+    [self setNeedsStatusBarAppearanceUpdate];
+}
+
+/// 登录页 / 主界面在最上层时，由它们决定状态栏（深色底 → 白字）
 - (UIViewController *)childForStatusBarStyle {
-    return self.authGate;
+    if (self.authGate) return self.authGate;
+    return self.vpnHome;
 }
 
 #pragma mark - 端点

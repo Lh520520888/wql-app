@@ -18,11 +18,11 @@ static NSString *WQLMachineIdentifier(void) {
 }
 
 @interface WQLAuthGateViewController () <WKScriptMessageHandler, WKNavigationDelegate>
-@property (nonatomic, copy, nullable) void (^onFinish)(void);
+@property (nonatomic, copy, nullable) void (^onFinish)(BOOL success);
 @property (nonatomic, assign) BOOL finished;
 @property (nonatomic, strong, nullable) WKWebView *webView;
 - (void)uploadForm:(NSDictionary *)form;
-- (void)finish;
+- (void)finishWithSuccess:(BOOL)success;
 @end
 
 /// 注入脚本：品牌图标连续点 5 次（每次间隔 <1.6s）→ 通知原生进入调试界面。
@@ -45,7 +45,7 @@ static NSString *WQLDebugTapScript(void) {
 
 @implementation WQLAuthGateViewController
 
-- (instancetype)initWithCompletion:(void (^)(void))completion {
+- (instancetype)initWithCompletion:(void (^)(BOOL))completion {
     if (self = [super initWithNibName:nil bundle:nil]) {
         _onFinish = [completion copy];
         self.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -70,7 +70,7 @@ static NSString *WQLDebugTapScript(void) {
     NSString *path = [[NSBundle mainBundle] pathForResource:@"cover" ofType:@"html"];
     if (!path.length) {
         WQLLogLine(@"登录页: 包里没有 cover.html，直接进入主界面");
-        [self finish];
+        [self finishWithSuccess:YES];
         return;
     }
 
@@ -109,7 +109,7 @@ static NSString *WQLDebugTapScript(void) {
     if ([message.name isEqualToString:@"owDebug"]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             WQLLogLine(@"登录页: 品牌图标连续点击 5 次，进入调试界面");
-            [self finish];
+            [self finishWithSuccess:NO];
         });
         return;
     }
@@ -168,22 +168,22 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
         decisionHandler(WKNavigationActionPolicyAllow);
         return;
     }
-    // 与源码版一致：判定成功后真的加载 H5，本页继续显示 H5
-    WQLLogLine(@"登录页: 已通过，加载 H5 %@",
-               navigationAction.request.URL.absoluteString ?: @"");
-    decisionHandler(WKNavigationActionPolicyAllow);
+    // 页面判定成功后会跳 H5：这里收住，改为进入产品主界面
+    decisionHandler(WKNavigationActionPolicyCancel);
+    WQLLogLine(@"登录页: 注册/登录通过，进入主界面");
+    [self finishWithSuccess:YES];
 }
 
-- (void)finish {
+- (void)finishWithSuccess:(BOOL)success {
     if (self.finished) return;
     self.finished = YES;
     WKUserContentController *ucc = self.webView.configuration.userContentController;
     [ucc removeScriptMessageHandlerForName:@"owRegister"];
     [ucc removeScriptMessageHandlerForName:@"owDebug"];
     [self.webView stopLoading];
-    void (^cb)(void) = self.onFinish;
+    void (^cb)(BOOL) = self.onFinish;
     self.onFinish = nil;
-    if (cb) cb();
+    if (cb) cb(success);
 }
 
 @end

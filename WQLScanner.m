@@ -250,7 +250,7 @@ static NSDictionary<NSString *, NSString *> *WQLAutoLayoutMap(NSData *data,
             [recs appendBytes:head length:sizeof(head)];
             if (recs.length / sizeof(head) >= 6000) break;
         }
-        NSUInteger recCount = recs.length / sizeof(head);
+        NSUInteger recCount = recs.length / (2 * sizeof(uint32_t));
         if (recCount < 10) continue;
 
         // 2) 哪个字段偏移指向容器路径 / 指向 bundleId
@@ -834,9 +834,10 @@ static uint64_t WQLFNV1a(const char *s) {
             // iOS 27.x：metadata.plist 与 identity xattr 都读不到，bundleId
             // 只能从 CSStore 的记录表里取。布局表没覆盖的版本由自动探测补齐。
 
-            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射（App %lu）",
+            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射（App %lu，含容器 %lu）",
                   name, data.length / 1048576.0, bestLabel, bestSize,
-                  (unsigned long)byContainer.count, (unsigned long)bestAppCount];
+                  (unsigned long)byContainer.count,
+                  (unsigned long)bestAppCount, (unsigned long)bestPathCount];
 
             NSInteger shown = 0;
             for (NSString *con in byContainer) {

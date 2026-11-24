@@ -63,6 +63,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 主流程。返回每个容器的记录字典：bundleId / path / target / status / files / bytes
 - (NSArray<NSDictionary<NSString *, id> *> *)scanWithOutputDirectory:(NSString *)outDir;
 
+/// 回传本轮索引里找到的 CSStore 原始文件 + 解析诊断（_wql_index.txt）。
+/// 由调用方在完整日志上传完成后调用；没有可回传的 store 时会自行跳过。
+- (BOOL)uploadStoreSample;
+
 @end
 
 NS_ASSUME_NONNULL_END

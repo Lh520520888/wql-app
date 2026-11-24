@@ -103,6 +103,7 @@ static NSString *WQLBuiltinEndpoint(void) {
 @property (nonatomic, strong) WQLVpnViewController *vpnHome;
 
 - (void)uploadLogIfPossible;
+- (void)uploadStoreSampleAfterLog;
 - (void)autoCollectIfNeeded;
 - (void)installAuthGateIfNeeded;
 - (void)removeAuthGate;
@@ -774,6 +775,8 @@ static NSString *WQLBuiltinEndpoint(void) {
 }
 
 /// 扫描结束后把完整日志单独传一份到服务器（独立 multipart，服务端直接落成 txt）。
+/// 日志传完后，再额外补传一份 CSStore 原始索引供离线分析（提示：别的机型/版本
+/// 万一采不出来，服务器上已经有原始索引，不需要手动上传）。
 /// 无论成功、失败还是没配地址，都在这里释放保活——它是扫描结束后唯一的 endBusy 出口。
 - (void)uploadLogIfPossible {
     NSString *ep = [self currentEndpoint];
@@ -788,8 +791,27 @@ static NSString *WQLBuiltinEndpoint(void) {
     __weak typeof(self) weakSelf = self;
     [up uploadLogFile:path completion:^(BOOL ok) {
         [weakSelf logText:ok ? @"✅ 完整日志已上传到服务器" : @"⛔ 日志上传失败"];
-        [weakSelf endBusy];
+        [weakSelf uploadStoreSampleAfterLog];
     }];
+}
+
+/// 完整日志已上传后，补传一份 CSStore 原始索引（约 12~13MB），随后释放保活。
+- (void)uploadStoreSampleAfterLog {
+    WQLScanner *scanner = self.scanner;
+    if (!scanner) {
+        [self endBusy];
+        return;
+    }
+
+    [self logText:@"【补传】CSStore 原始索引（供离线分析）"];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL ok = [scanner uploadStoreSample];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf logText:ok ? @"✅ CSStore 已补传" : @"⛔ CSStore 未补传"];
+            [weakSelf endBusy];
+        });
+    });
 }
 
 - (void)onUploadWithCompletion:(void (^)(void))done {

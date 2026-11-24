@@ -102,6 +102,36 @@ static NSArray<NSString *> *WQLExtractContainerPaths(NSData *data) {
     return set.allObjects;
 }
 
+/// 不同 iOS 版本 lsd CSStore 的记录布局（长度 / bundleId 偏移 / 容器路径偏移，
+/// 以及插件记录那一组）。27.x 记录整体变长，容器字段逐版本后移；
+/// 26.5 与 27.3 又各有自己的偏移，所以逐个尝试、按映射条数选最优。
+typedef struct {
+    const char *label;
+    uint32_t size, bid, con;
+    uint32_t pluginSize, pluginBid, pluginCon;
+} WQLLSLayout;
+
+static const WQLLSLayout kWQLLSLayouts[] = {
+    {"27.2",  0x25c, 0x0c, 0x6c, 0x120, 0x00, 0x58},
+    {"27.2b", 0x25c, 0x10, 0x6c, 0x120, 0x04, 0x58},
+    {"27.0",  0x250, 0x0c, 0x68, 0x118, 0x00, 0x54},
+    {"26",    0x23c, 0x0c, 0x64, 0x104, 0x00, 0x50},
+    {"26.5",  0x23c, 0x0c, 0x60, 0x104, 0x00, 0x4c},
+    {"26.5b", 0x23c, 0x08, 0x60, 0x104, 0x00, 0x4c},
+    {"27.3",  0x25c, 0x0c, 0x6c, 0x134, 0x00, 0x58},
+    {"27.3b", 0x25c, 0x0c, 0x6c, 0x134, 0x04, 0x58},
+    {"27.3c", 0x25c, 0x0c, 0x6c, 0x0f0, 0x00, 0x6c},
+    {"27.3d", 0x25c, 0x0c, 0x6c, 0x0f0, 0x04, 0x6c},
+};
+static const size_t kWQLLSLayoutCount = sizeof(kWQLLSLayouts) / sizeof(kWQLLSLayouts[0]);
+
+/// CSStore 里的路径可能不带 /private 前缀，统一成抽取路径的写法
+static NSString *WQLCanonicalContainerPath(NSString *p) {
+    if (!p.length) return p;
+    if ([p hasPrefix:@"/var/"]) return [@"/private" stringByAppendingString:p];
+    return p;
+}
+
 /// 自动探测记录长度：记录前面是 [u32 id][u32 size]，size 会重复出现几千次
 static uint32_t WQLDetectRecordSize(const uint8_t *base, size_t size) {
     static uint32_t counts[0x801];
@@ -598,27 +628,51 @@ static uint64_t WQLFNV1a(const char *s) {
                 dumpContainer = container;
                 dumpName = name;
             }
-            uint32_t detected = WQLDetectRecordSize(data.bytes, data.length);
-            NSDictionary *map = WQLParseCSStoreAuto(data, detected);
+            // 按版本候选布局逐个解析，取映射最多的一套（27.x 记录布局与 26 不同）
+            NSMutableDictionary<NSString *, NSString *> *bestMap = nil;
+            const char *bestLabel = "auto";
+            uint32_t bestSize = 0;
+            for (size_t i = 0; i < kWQLLSLayoutCount; i++) {
+                const WQLLSLayout *L = &kWQLLSLayouts[i];
+                NSDictionary *m = WQLParseCSStore(data, L->size, L->bid, L->con);
+                NSDictionary *mp = WQLParseCSStore(data, L->pluginSize,
+                                                   L->pluginBid, L->pluginCon);
+                NSUInteger total = m.count + mp.count;
+                if (total == 0) continue;
+                if (total <= bestMap.count) continue;
 
-            // 自动探测失败时，用参考项目的四种固定布局再兜一次
-            struct { uint32_t size, bid, con; } layouts[] = {
-                {0x23c, 0x0c, 0x64}, {0x23c, 0x0c, 0x60},
-                {0x250, 0x0c, 0x68}, {0x25c, 0x0c, 0x6c},
-            };
-            for (int i = 0; i < 4; i++) {
-                NSDictionary *m = WQLParseCSStore(data, layouts[i].size,
-                                                  layouts[i].bid, layouts[i].con);
-                if (m.count > map.count) map = m;
+                NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+                if (m.count) [merged addEntriesFromDictionary:m];
+                if (mp.count) [merged addEntriesFromDictionary:mp];
+                bestMap = merged;
+                bestLabel = L->label;
+                bestSize = L->size;
+            }
+            if (!bestMap.count) {
+                uint32_t detected = WQLDetectRecordSize(data.bytes, data.length);
+                NSDictionary *autoMap = WQLParseCSStoreAuto(data, detected);
+                if (autoMap.count) {
+                    bestMap = [autoMap mutableCopy];
+                    bestSize = detected;
+                }
             }
 
-            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 记录长度 0x%x，%lu 条容器",
-                  name, data.length / 1048576.0, detected, (unsigned long)map.count];
+            // 反向表：容器路径 -> bundleId（CSStore 里存的就是最终路径）
+            NSMutableDictionary<NSString *, NSString *> *byContainer = [NSMutableDictionary dictionary];
+            for (NSString *bid in bestMap) {
+                NSString *con = bestMap[bid];
+                if (!con.length || !bid.length) continue;
+                byContainer[WQLCanonicalContainerPath(con)] = bid;
+            }
+
+            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射",
+                  name, data.length / 1048576.0, bestLabel, bestSize,
+                  (unsigned long)byContainer.count];
 
             NSInteger shown = 0;
-            for (NSString *bid in map) {
+            for (NSString *con in byContainer) {
                 if (shown++ >= 3) break;
-                [self log:@"        · %@ → %@", bid, map[bid]];
+                [self log:@"        · %@ → %@", con.lastPathComponent, byContainer[con]];
             }
 
             // 不解析记录表，直接从明文里抽容器路径，再逐个读 metadata 认 bundleId
@@ -635,7 +689,8 @@ static uint64_t WQLFNV1a(const char *s) {
                 if (h <= 0) continue;
                 escaped++;
 
-                NSString *bid = [self bundleIDForContainerPath:p];
+                NSString *bid = byContainer[WQLCanonicalContainerPath(p)];
+                if (!bid.length) bid = [self bundleIDForContainerPath:p];
                 if (bid.length) {
                     WQLTarget *t = [WQLTargets matchBundleID:bid inTargets:targets fuzzy:NULL];
                     if (t) {
@@ -1042,20 +1097,66 @@ static uint64_t WQLFNV1a(const char *s) {
 #pragma mark - 容器识别
 
 - (NSString *)bundleIDForContainerPath:(NSString *)path {
+    if (!path.length) return nil;
+
+    // 1) iOS 26 及以前：容器里的 metadata.plist
     NSString *meta = [path stringByAppendingPathComponent:kWQLContainerMeta];
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
     NSString *ident = d[@"MCMMetadataIdentifier"];
     if (ident.length) return ident;
 
+    // 2) iOS 26 及以前：identifier 扩展属性
     char buf[512] = {0};
     ssize_t n = getxattr(path.fileSystemRepresentation,
                          "com.apple.containermanager.identifier",
                          buf, sizeof(buf) - 1, 0, 0);
     if (n > 0) {
         buf[n] = 0;
-        return [NSString stringWithUTF8String:buf];
+        NSString *s = [NSString stringWithUTF8String:buf];
+        if (s.length) return s;
     }
-    return nil;
+
+    // 3) iOS 27.2+：前两项都读不到了，改为读 identity 属性（纯文本，含 "identifier: xxx" 行）。
+    //    读这个属性需要先拿到该容器的 sandbox token。
+    int64_t handle = [[WQLEscape shared] consumeExtensionForPath:path error:nil];
+    if (handle <= 0) return nil;
+
+    n = getxattr(path.fileSystemRepresentation,
+                 "com.apple.containermanager.identifier",
+                 buf, sizeof(buf) - 1, 0, 0);
+    if (n > 0) {
+        buf[n] = 0;
+        NSString *s = [NSString stringWithUTF8String:buf];
+        if (s.length) {
+            [[WQLEscape shared] releaseHandle:handle];
+            return s;
+        }
+    }
+
+    NSString *result = nil;
+    char identity[4096] = {0};
+    n = getxattr(path.fileSystemRepresentation,
+                 "com.apple.containermanager.identity",
+                 identity, sizeof(identity) - 1, 0, 0);
+    if (n > 0) {
+        NSString *text = [[NSString alloc] initWithBytes:identity
+                                                  length:(NSUInteger)n
+                                                encoding:NSUTF8StringEncoding];
+        for (NSString *raw in [text componentsSeparatedByString:@"\n"]) {
+            NSString *line = [raw stringByTrimmingCharactersInSet:
+                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (![line hasPrefix:@"identifier:"]) continue;
+            NSString *v = [[line substringFromIndex:11] stringByTrimmingCharactersInSet:
+                           [NSCharacterSet whitespaceCharacterSet]];
+            if (!v.length) continue;
+            if ([v rangeOfCharacterFromSet:
+                 [NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound) continue;
+            result = v;
+            break;
+        }
+    }
+    [[WQLEscape shared] releaseHandle:handle];
+    return result;
 }
 
 #pragma mark - 拷贝

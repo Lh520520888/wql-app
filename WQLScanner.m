@@ -132,6 +132,83 @@ static NSString *WQLCanonicalContainerPath(NSString *p) {
     return p;
 }
 
+#pragma mark - iOS 27.x：从明文建立 容器UUID → bundleId
+
+static inline BOOL WQLIsUpperHex(uint8_t c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+}
+
+/// b[i..i+36) 是否是 8-4-4-4-12 的大写 UUID
+static BOOL WQLUUIDAt(const uint8_t *b, size_t n, size_t i) {
+    if (i + 36 > n) return NO;
+    static const uint8_t dashes[4] = {8, 13, 18, 23};
+    for (size_t k = 0; k < 36; k++) {
+        BOOL wantDash = NO;
+        for (int d = 0; d < 4; d++) if (dashes[d] == k) { wantDash = YES; break; }
+        if (wantDash) {
+            if (b[i + k] != '-') return NO;
+        } else if (!WQLIsUpperHex(b[i + k])) {
+            return NO;
+        }
+    }
+    // 前后不能紧邻十六进制字符，否则可能是更长的串
+    if (i > 0 && WQLIsUpperHex(b[i - 1])) return NO;
+    if (i + 36 < n && WQLIsUpperHex(b[i + 36])) return NO;
+    return YES;
+}
+
+/// iOS 27.x 的 lsd CSStore 把 bundleId 内联存储，不再走字符串表引用：
+///   [容器UUID][1 字节标记][0x19 0x01 0x00][u32 长度][bundleId 明文]
+/// 因此直接扫 UUID，再看其后 1~8 字节内是否跟着这个结构，
+/// 就能建立 容器UUID → bundleId，不依赖 metadata.plist / xattr。
+static NSDictionary<NSString *, NSString *> *WQLMapUUIDToBundleID(NSData *data) {
+    const uint8_t *b = data.bytes;
+    size_t n = data.length;
+    if (n < 0x1000) return nil;
+
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+    for (size_t i = 4; i + 44 <= n; i++) {
+        // 快速跳过：UUID 第 9 个字节必须是 '-'
+        if (b[i + 8] != '-') continue;
+        if (!WQLIsUpperHex(b[i])) continue;
+        if (!WQLUUIDAt(b, n, i)) continue;
+
+        for (size_t d = 1; d <= 8; d++) {
+            size_t p = i + 36 + d;
+            if (p + 8 > n) break;
+            if (b[p] != 0x19 || b[p + 1] != 0x01 || b[p + 2] != 0x00) continue;
+
+            uint32_t len;
+            memcpy(&len, b + p + 4, 4);
+            if (len < 5 || len > 120) break;
+            if (p + 8 + len > n) break;
+
+            const uint8_t *s = b + p + 8;
+            BOOL ok = YES;
+            for (uint32_t k = 0; k < len; k++) {
+                uint8_t c = s[k];
+                if (c < 0x20 || c > 0x7e) { ok = NO; break; }
+            }
+            if (!ok) break;
+
+            NSString *bid = [[NSString alloc] initWithBytes:s
+                                                     length:len
+                                                   encoding:NSUTF8StringEncoding];
+            if (bid.length && WQLLooksLikeBundleID(bid)) {
+                NSString *uuid = [[NSString alloc] initWithBytes:b + i
+                                                          length:36
+                                                        encoding:NSUTF8StringEncoding];
+                if (uuid.length) {
+                    // 同一个 UUID 只认第一条（紧跟记录键的那个就是 App 本体）
+                    if (!map[uuid]) map[uuid] = bid;
+                }
+            }
+            break;
+        }
+    }
+    return map.count ? map : nil;
+}
+
 /// 自动探测记录长度：记录前面是 [u32 id][u32 size]，size 会重复出现几千次
 static uint32_t WQLDetectRecordSize(const uint8_t *base, size_t size) {
     static uint32_t counts[0x801];
@@ -662,6 +739,13 @@ static uint64_t WQLFNV1a(const char *s) {
                 byContainer[WQLCanonicalContainerPath(con)] = bid;
             }
 
+            // iOS 27.x：记录布局解析基本失效，但 bundleId 是内联明文，
+            // 用「容器 UUID → bundleId」直接从明文建表，不依赖 metadata / xattr。
+            NSDictionary<NSString *, NSString *> *uuidMap = WQLMapUUIDToBundleID(data);
+            if (uuidMap.count) {
+                [self log:@"    明文 UUID 映射：%lu 条", (unsigned long)uuidMap.count];
+            }
+
             [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射",
                   name, data.length / 1048576.0, bestLabel, bestSize,
                   (unsigned long)byContainer.count];
@@ -677,6 +761,7 @@ static uint64_t WQLFNV1a(const char *s) {
             [self log:@"    路径抽取：%lu 个容器路径", (unsigned long)paths.count];
 
             NSUInteger escaped = 0, matched = 0;
+            NSUInteger xattrTries = 0;
             for (NSString *raw in paths) {
                 NSString *p = [raw hasSuffix:@"/"] ? [raw substringToIndex:raw.length - 1] : raw;
                 if ([seen containsObject:p]) continue;
@@ -687,7 +772,17 @@ static uint64_t WQLFNV1a(const char *s) {
                 escaped++;
 
                 NSString *bid = byContainer[WQLCanonicalContainerPath(p)];
-                if (!bid.length) bid = [self bundleIDForContainerPath:p];
+                if (!bid.length && uuidMap.count) {
+                    // 27.x：路径最后一段就是容器 UUID，直接查明文表
+                    NSString *uuid = p.lastPathComponent.uppercaseString;
+                    if (uuid.length == 36) bid = uuidMap[uuid];
+                }
+                // 明文表覆盖不到时回退读 xattr，但限次数：27.x 上每个容器都要
+                // 先拿 token 再读属性，全量跑会很慢，留一个上限避免拖死。
+                if (!bid.length && xattrTries < 400) {
+                    xattrTries++;
+                    bid = [self bundleIDForContainerPath:p];
+                }
                 if (bid.length) {
                     WQLTarget *t = [WQLTargets matchBundleID:bid inTargets:targets fuzzy:NULL];
                     if (t) {

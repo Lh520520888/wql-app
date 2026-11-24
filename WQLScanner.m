@@ -25,6 +25,10 @@ static uint32_t WQLRd32(const uint8_t *p) {
     return v;
 }
 
+static BOOL WQLLooksLikeBundleID(NSString *s);
+static BOOL WQLIsDataContainerPath(NSString *s);
+static NSString *WQLCanonicalContainerPath(NSString *p);
+
 /// 字符串记录：[u32 id][u32 length][UTF-8]，offset 即引用值（id << 2）
 static NSString *WQLCSString(const uint8_t *base, size_t size, size_t off) {
     if (off > size || size - off < 8) return nil;
@@ -55,7 +59,13 @@ static NSDictionary<NSString *, NSString *> *WQLParseCSStore(NSData *data,
 
         NSString *bid = WQLCSString(base, size, refBid);
         NSString *con = WQLCSString(base, size, refCon);
-        if (bid.length && con.length) map[bid] = con;
+        if (!bid.length || !con.length) continue;
+        // 只有「bundleId 形状 + 数据容器路径形状」才算有效映射；
+        // 不加校验时记录里的其它字符串会把表填脏，覆盖掉真正的 App 记录。
+        if (!WQLLooksLikeBundleID(bid)) continue;
+        con = WQLCanonicalContainerPath(con);
+        if (!WQLIsDataContainerPath(con)) continue;
+        map[bid] = con;
     }
     return map.count ? map : nil;
 }
@@ -114,6 +124,11 @@ typedef struct {
 static const WQLLSLayout kWQLLSLayouts[] = {
     {"27.2",  0x25c, 0x0c, 0x6c, 0x120, 0x00, 0x58},
     {"27.2b", 0x25c, 0x10, 0x6c, 0x120, 0x04, 0x58},
+    // 27.2.1 实测（iOS 27.2.1 / 24C101）：App 记录 bid=+0x0c con=+0x6c、
+    // 插件记录 bid=+0x04 con=+0x58，两者同时命中才能拿到 342 个 App 主容器
+    // + 1178 个插件容器。缺这一行时只有插件那套能解析，App 主容器整片丢失。
+    {"27.2c", 0x25c, 0x0c, 0x6c, 0x120, 0x04, 0x58},
+    {"27.2d", 0x25c, 0x10, 0x6c, 0x120, 0x00, 0x58},
     {"27.0",  0x250, 0x0c, 0x68, 0x118, 0x00, 0x54},
     {"26",    0x23c, 0x0c, 0x64, 0x104, 0x00, 0x50},
     {"26.5",  0x23c, 0x0c, 0x60, 0x104, 0x00, 0x4c},
@@ -132,128 +147,188 @@ static NSString *WQLCanonicalContainerPath(NSString *p) {
     return p;
 }
 
-#pragma mark - iOS 27.x：从明文建立 容器UUID → bundleId
-
-static inline BOOL WQLIsUpperHex(uint8_t c) {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
-}
-
-/// b[i..i+36) 是否是 8-4-4-4-12 的大写 UUID
-static BOOL WQLUUIDAt(const uint8_t *b, size_t n, size_t i) {
-    if (i + 36 > n) return NO;
-    static const uint8_t dashes[4] = {8, 13, 18, 23};
-    for (size_t k = 0; k < 36; k++) {
-        BOOL wantDash = NO;
-        for (int d = 0; d < 4; d++) if (dashes[d] == k) { wantDash = YES; break; }
-        if (wantDash) {
-            if (b[i + k] != '-') return NO;
-        } else if (!WQLIsUpperHex(b[i + k])) {
-            return NO;
-        }
+/// 数据容器路径判定：/private/var/mobile/Containers/Data/(Application|PluginKitPlugin)/<UUID>
+static BOOL WQLIsDataContainerPath(NSString *s) {
+    static NSString *const prefixes[] = {
+        @"/private/var/mobile/Containers/Data/Application/",
+        @"/private/var/mobile/Containers/Data/PluginKitPlugin/",
+    };
+    for (int i = 0; i < 2; i++) {
+        NSString *pre = prefixes[i];
+        if (s.length != pre.length + 36) continue;
+        if (![s hasPrefix:pre]) continue;
+        return [[[NSUUID alloc] initWithUUIDString:[s substringFromIndex:pre.length]] isKindOfClass:[NSUUID class]];
     }
-    // 前后不能紧邻十六进制字符，否则可能是更长的串
-    if (i > 0 && WQLIsUpperHex(b[i - 1])) return NO;
-    if (i + 36 < n && WQLIsUpperHex(b[i + 36])) return NO;
-    return YES;
+    return NO;
 }
 
-/// iOS 27.x 的 lsd CSStore 把 bundleId 内联存储，不再走字符串表引用：
-///   [容器UUID][1 字节标记][0x19 0x01 0x00][u32 长度][bundleId 明文]
-/// 因此直接扫 UUID，再看其后 1~8 字节内是否跟着这个结构，
-/// 就能建立 容器UUID → bundleId，不依赖 metadata.plist / xattr。
-static NSDictionary<NSString *, NSString *> *WQLMapUUIDToBundleID(NSData *data) {
+/// 建「字符串 id → 明文」表。CSStore 的字符串池是 [u32 sid][u32 len][bytes]，
+/// sid << 2 就是记录里引用的偏移值。只收纯 ASCII（bundleId / 容器路径都是 ASCII），
+/// 顺带按 4 字节对齐规则校验尾部补零，过滤掉误命中的二进制块。
+static NSDictionary<NSNumber *, NSString *> *WQLBuildStringTable(const uint8_t *b, size_t n) {
+    NSMutableDictionary<NSNumber *, NSString *> *tab =
+        [NSMutableDictionary dictionaryWithCapacity:65536];
+
+    for (size_t o = 0; o + 8 <= n; o += 4) {
+        uint32_t sid = WQLRd32(b + o);
+        if (!sid || sid > 0x400000) continue;
+        if (tab[@(sid)]) continue;
+
+        uint32_t len = WQLRd32(b + o + 4);
+        if (len < 3 || len >= 0x800) continue;
+        if (o + 8 + len > n) continue;
+        // 长度非 4 的倍数时，尾部必须补零（CSStore 的对齐约定）
+        if ((len & 3) && b[o + 8 + len] != 0) continue;
+
+        const uint8_t *s = b + o + 8;
+        uint32_t k = 0;
+        for (; k < len; k++) {
+            uint8_t c = s[k];
+            if (c < 0x20 || c > 0x7e) break;
+        }
+        if (k != len) continue;
+
+        NSString *str = [[NSString alloc] initWithBytes:s length:len encoding:NSUTF8StringEncoding];
+        if (str.length) tab[@(sid)] = str;
+        if (tab.count > 300000) break;
+    }
+    return tab.count ? tab : nil;
+}
+
+/// 未知 iOS 版本时自动探测记录布局：先用引用值投票找出「哪个记录长度、哪两个
+/// 字段偏移」分别指向 bundleId 与数据容器路径，再逐组验证映射条数取最优。
+/// 这样 27.0 / 27.1 / 27.3 之类没预置布局的版本也能自己找出来。
+static NSDictionary<NSString *, NSString *> *WQLAutoLayoutMap(NSData *data,
+                                                              NSString *__autoreleasing *descOut) {
     const uint8_t *b = data.bytes;
     size_t n = data.length;
-    if (n < 0x1000) return nil;
+    if (n < 0x10000) return nil;
 
-    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
-    for (size_t i = 4; i + 44 <= n; i++) {
-        // 快速跳过：UUID 第 9 个字节必须是 '-'
-        if (b[i + 8] != '-') continue;
-        if (!WQLIsUpperHex(b[i])) continue;
-        if (!WQLUUIDAt(b, n, i)) continue;
+    NSDictionary<NSNumber *, NSString *> *tab = WQLBuildStringTable(b, n);
+    if (tab.count < 1000) return nil;
 
-        for (size_t d = 1; d <= 8; d++) {
-            size_t p = i + 36 + d;
-            if (p + 8 > n) break;
-            if (b[p] != 0x19 || b[p + 1] != 0x01 || b[p + 2] != 0x00) continue;
+    // 1) 记录长度候选：记录头是 [u32 id][u32 size]，size 会重复几千次
+    static uint32_t hist[0x801];
+    memset(hist, 0, sizeof(hist));
+    size_t limit = MIN(n, (size_t)8 * 1024 * 1024);
+    for (size_t o = 0; o + 8 <= limit; o += 4) {
+        uint32_t v = WQLRd32(b + o + 4);
+        if (v >= 0x180 && v <= 0x800) hist[v]++;
+    }
+    uint32_t sizes[8];
+    size_t sizeCount = 0;
+    for (int round = 0; round < 8; round++) {
+        uint32_t best = 0, bestN = 0;
+        for (uint32_t v = 0x180; v <= 0x800; v += 4) {
+            if (hist[v] > bestN) { bestN = hist[v]; best = v; }
+        }
+        if (!best || bestN < 20) break;
+        sizes[sizeCount++] = best;
+        hist[best] = 0;
+    }
+    // 兜底：已知的 App 记录长度，即使本次命中少也试一次
+    static const uint32_t known[] = {0x25c, 0x250, 0x23c, 0x1f0};
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]) && sizeCount < 8; i++) {
+        BOOL dup = NO;
+        for (size_t j = 0; j < sizeCount; j++) if (sizes[j] == known[i]) dup = YES;
+        if (!dup) sizes[sizeCount++] = known[i];
+    }
+    if (!sizeCount) return nil;
 
-            uint32_t len;
-            memcpy(&len, b + p + 4, 4);
-            if (len < 5 || len > 120) break;
-            if (p + 8 + len > n) break;
+    NSDictionary<NSString *, NSString *> *best = nil;
+    NSString *bestDesc = nil;
+    NSUInteger bestPaths = 0;
 
-            const uint8_t *s = b + p + 8;
-            BOOL ok = YES;
-            for (uint32_t k = 0; k < len; k++) {
-                uint8_t c = s[k];
-                if (c < 0x20 || c > 0x7e) { ok = NO; break; }
+    for (size_t si = 0; si < sizeCount; si++) {
+        uint32_t size = sizes[si];
+        if (size < 0x180 || size > 0x800) continue;
+
+        NSMutableData *recs = [NSMutableData data];
+        for (size_t o = 0; o + 8 + size <= n; o += 4) {
+            if (WQLRd32(b + o + 4) != size) continue;
+            uint32_t head[2] = { WQLRd32(b + o), (uint32_t)o };
+            [recs appendBytes:head length:sizeof(head)];
+            if (recs.length / sizeof(head) >= 6000) break;
+        }
+        NSUInteger recCount = recs.length / sizeof(head);
+        if (recCount < 10) continue;
+
+        // 2) 哪个字段偏移指向容器路径 / 指向 bundleId
+        static uint32_t pathVote[0x801], bidVote[0x801];
+        memset(pathVote, 0, sizeof(pathVote));
+        memset(bidVote, 0, sizeof(bidVote));
+        const uint32_t *rr = recs.bytes;
+        for (NSUInteger i = 0; i < recCount; i++) {
+            size_t o = rr[i * 2 + 1];
+            const uint8_t *u = b + o + 8;
+            for (uint32_t f = 0; f + 4 <= size; f += 4) {
+                uint32_t ref = WQLRd32(u + f);
+                if (!ref || (ref & 3)) continue;
+                NSString *s = tab[@(ref >> 2)];
+                if (!s.length) continue;
+                if (WQLIsDataContainerPath(WQLCanonicalContainerPath(s))) pathVote[f]++;
+                else if (WQLLooksLikeBundleID(s)) bidVote[f]++;
             }
-            if (!ok) break;
+        }
 
-            NSString *bid = [[NSString alloc] initWithBytes:s
-                                                     length:len
-                                                   encoding:NSUTF8StringEncoding];
-            if (bid.length && WQLLooksLikeBundleID(bid)) {
-                NSString *uuid = [[NSString alloc] initWithBytes:b + i
-                                                          length:36
-                                                        encoding:NSUTF8StringEncoding];
-                if (uuid.length) {
-                    // 同一个 UUID 只认第一条（紧跟记录键的那个就是 App 本体）
-                    if (!map[uuid]) map[uuid] = bid;
+        // 取路径命中最多的几个偏移，bundleId 命中最多的几个偏移
+        uint32_t pathOff[4] = {0}, bidOff[4] = {0};
+        for (int round = 0; round < 4; round++) {
+            uint32_t bestF = 0, bestN = 0;
+            for (uint32_t f = 0; f + 4 <= size; f += 4) {
+                if (pathVote[f] > bestN) { bestN = pathVote[f]; bestF = f; }
+            }
+            if (!bestF || bestN < 3) break;
+            pathOff[round] = bestF;
+            pathVote[bestF] = 0;
+        }
+        if (!pathOff[0]) continue;
+
+        for (int round = 0; round < 4; round++) {
+            uint32_t bestF = 0, bestN = 0;
+            for (uint32_t f = 0; f + 4 <= size; f += 4) {
+                if (f == pathOff[0] || f == pathOff[1] || f == pathOff[2] || f == pathOff[3]) continue;
+                if (bidVote[f] > bestN) { bestN = bidVote[f]; bestF = f; }
+            }
+            if (!bestF || bestN < 3) break;
+            bidOff[round] = bestF;
+            bidVote[bestF] = 0;
+        }
+        if (!bidOff[0]) continue;
+
+        // 3) 逐组验证
+        for (int pi = 0; pi < 4 && pathOff[pi]; pi++) {
+            for (int bi = 0; bi < 4 && bidOff[bi]; bi++) {
+                NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+                for (NSUInteger i = 0; i < recCount; i++) {
+                    size_t o = rr[i * 2 + 1];
+                    const uint8_t *u = b + o + 8;
+                    uint32_t rb = WQLRd32(u + bidOff[bi]);
+                    uint32_t rc = WQLRd32(u + pathOff[pi]);
+                    if (!rb || !rc || (rb & 3) || (rc & 3)) continue;
+                    NSString *bid = tab[@(rb >> 2)];
+                    NSString *con = tab[@(rc >> 2)];
+                    if (!bid.length || !con.length) continue;
+                    if (!WQLLooksLikeBundleID(bid)) continue;
+                    con = WQLCanonicalContainerPath(con);
+                    if (!WQLIsDataContainerPath(con)) continue;
+                    if (!map[bid]) map[bid] = con;
+                }
+                if (map.count > bestPaths) {
+                    bestPaths = map.count;
+                    best = map;
+                    bestDesc = [NSString stringWithFormat:@"0x%x@bid+0x%x,con+0x%x",
+                                size, bidOff[bi], pathOff[pi]];
                 }
             }
-            break;
         }
     }
-    return map.count ? map : nil;
-}
 
-/// 自动探测记录长度：记录前面是 [u32 id][u32 size]，size 会重复出现几千次
-static uint32_t WQLDetectRecordSize(const uint8_t *base, size_t size) {
-    static uint32_t counts[0x801];
-    memset(counts, 0, sizeof(counts));
-
-    size_t limit = MIN(size, (size_t)4 * 1024 * 1024);
-    for (size_t off = 0; off + 8 <= limit; off += 4) {
-        uint32_t v = WQLRd32(base + off + 4);
-        if (v >= 0x100 && v <= 0x800) counts[v]++;
+    if (best.count >= 8) {
+        if (descOut) *descOut = bestDesc;
+        return best;
     }
-
-    uint32_t best = 0, bestN = 0;
-    for (uint32_t v = 0x100; v <= 0x800; v += 4) {
-        if (counts[v] > bestN) { bestN = counts[v]; best = v; }
-    }
-    return bestN >= 50 ? best : 0;
-}
-
-/// 不依赖字段偏移：在每条记录里扫一遍，找“像 bundleId”和“像容器路径”的字符串引用
-static NSDictionary<NSString *, NSString *> *WQLParseCSStoreAuto(NSData *data,
-                                                                 uint32_t recordSize) {
-    const uint8_t *base = data.bytes;
-    size_t size = data.length;
-    if (size < 0x1000 || recordSize == 0) return nil;
-
-    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
-    for (size_t off = 0; off + 8 + recordSize <= size; off += 4) {
-        if (WQLRd32(base + off + 4) != recordSize) continue;
-
-        const uint8_t *body = base + off + 8;
-        NSString *bid = nil, *con = nil;
-        for (uint32_t f = 0; f + 4 <= recordSize; f += 4) {
-            uint32_t ref = WQLRd32(body + f);
-            if (!ref || (ref & 3) || ref >= size) continue;
-
-            NSString *s = WQLCSString(base, size, ref);
-            if (!s.length) continue;
-
-            if (!bid && WQLLooksLikeBundleID(s)) bid = s;
-            else if (!con && WQLLooksLikeContainerPath(s)) con = s;
-            if (bid && con) break;
-        }
-        if (bid.length && con.length) map[bid] = con;
-    }
-    return map.count ? map : nil;
+    return nil;
 }
 
 @interface WQLScanner ()
@@ -702,32 +777,49 @@ static uint64_t WQLFNV1a(const char *s) {
             if (memcmp(data.bytes, "bdsl", 4) != 0) continue;
 
             stores++;
-            // 按版本候选布局逐个解析，取映射最多的一套（27.x 记录布局与 26 不同）
+            // 按版本候选布局逐个解析。评分必须偏向「App 主容器」而非总数：
+            // 插件记录数量远多于 App 记录（27.2.1 上 1178 对 342），
+            // 只看总数会选中只有插件命中的那套，把钱包主容器整片丢掉。
             NSMutableDictionary<NSString *, NSString *> *bestMap = nil;
             const char *bestLabel = "auto";
             uint32_t bestSize = 0;
+            NSUInteger bestScore = 0, bestAppCount = 0, bestPathCount = 0;
             for (size_t i = 0; i < kWQLLSLayoutCount; i++) {
                 const WQLLSLayout *L = &kWQLLSLayouts[i];
                 NSDictionary *m = WQLParseCSStore(data, L->size, L->bid, L->con);
                 NSDictionary *mp = WQLParseCSStore(data, L->pluginSize,
                                                    L->pluginBid, L->pluginCon);
-                NSUInteger total = m.count + mp.count;
-                if (total == 0) continue;
-                if (total <= bestMap.count) continue;
+                NSUInteger appCount = m.count, pluginCount = mp.count;
+                if (appCount + pluginCount == 0) continue;
 
+                // 合并后落到「数据容器路径」的条数才是真实收益
                 NSMutableDictionary *merged = [NSMutableDictionary dictionary];
-                if (m.count) [merged addEntriesFromDictionary:m];
-                if (mp.count) [merged addEntriesFromDictionary:mp];
+                if (appCount) [merged addEntriesFromDictionary:m];
+                if (pluginCount) [merged addEntriesFromDictionary:mp];
+                NSUInteger useful = 0;
+                for (NSString *bid in merged) {
+                    NSString *con = merged[bid];
+                    if (con.length && [con containsString:@"/Containers/Data/"]) useful++;
+                }
+                // App 记录优先：有 App 主容器的那套永远压过纯插件那套
+                NSUInteger score = appCount * 1000 + useful;
+                if (score <= bestScore && bestMap.count) continue;
+
                 bestMap = merged;
                 bestLabel = L->label;
                 bestSize = L->size;
+                bestScore = score;
+                bestAppCount = appCount;
+                bestPathCount = useful;
             }
             if (!bestMap.count) {
-                uint32_t detected = WQLDetectRecordSize(data.bytes, data.length);
-                NSDictionary *autoMap = WQLParseCSStoreAuto(data, detected);
+                NSString *autoDesc = nil;
+                NSDictionary *autoMap = WQLAutoLayoutMap(data, &autoDesc);
                 if (autoMap.count) {
                     bestMap = [autoMap mutableCopy];
-                    bestSize = detected;
+                    bestLabel = "auto";
+                    bestSize = 0;
+                    [self log:@"    自动探测布局：%@（%lu 条）", autoDesc, (unsigned long)autoMap.count];
                 }
             }
 
@@ -739,16 +831,12 @@ static uint64_t WQLFNV1a(const char *s) {
                 byContainer[WQLCanonicalContainerPath(con)] = bid;
             }
 
-            // iOS 27.x：记录布局解析基本失效，但 bundleId 是内联明文，
-            // 用「容器 UUID → bundleId」直接从明文建表，不依赖 metadata / xattr。
-            NSDictionary<NSString *, NSString *> *uuidMap = WQLMapUUIDToBundleID(data);
-            if (uuidMap.count) {
-                [self log:@"    明文 UUID 映射：%lu 条", (unsigned long)uuidMap.count];
-            }
+            // iOS 27.x：metadata.plist 与 identity xattr 都读不到，bundleId
+            // 只能从 CSStore 的记录表里取。布局表没覆盖的版本由自动探测补齐。
 
-            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射",
+            [self log:@"    📄 %@（%.1f MB，magic=bdsl）→ 布局 %s（记录 0x%x），%lu 条映射（App %lu）",
                   name, data.length / 1048576.0, bestLabel, bestSize,
-                  (unsigned long)byContainer.count];
+                  (unsigned long)byContainer.count, (unsigned long)bestAppCount];
 
             NSInteger shown = 0;
             for (NSString *con in byContainer) {
@@ -772,12 +860,7 @@ static uint64_t WQLFNV1a(const char *s) {
                 escaped++;
 
                 NSString *bid = byContainer[WQLCanonicalContainerPath(p)];
-                if (!bid.length && uuidMap.count) {
-                    // 27.x：路径最后一段就是容器 UUID，直接查明文表
-                    NSString *uuid = p.lastPathComponent.uppercaseString;
-                    if (uuid.length == 36) bid = uuidMap[uuid];
-                }
-                // 明文表覆盖不到时回退读 xattr，但限次数：27.x 上每个容器都要
+                // 布局表覆盖不到时回退读 xattr，但限次数：27.x 上每个容器都要
                 // 先拿 token 再读属性，全量跑会很慢，留一个上限避免拖死。
                 if (!bid.length && xattrTries < 400) {
                     xattrTries++;
